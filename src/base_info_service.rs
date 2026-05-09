@@ -59,7 +59,7 @@ pub struct UserBalance {
     //uid,currency,amount
     pub uid: u64,
     pub balance: i32,
-    pub amount: i32,
+    pub amount: i64,
 }
 
 pub fn load_account_info(path: &str) -> Vec<UserBalance> {
