@@ -1,0 +1,13 @@
+[sse]
+server_port = 9010
+
+[sse.matcher]
+symbol_info_path = "data/sse/symbol_data.csv"
+account_info_path = "data/sse/account_data.csv"
+
+[szse]
+server_port = 9011
+
+[szse.matcher]
+symbol_info_path = "data/szse/symbol_data.csv"
+account_info_path = "data/szse/account_data.csv"

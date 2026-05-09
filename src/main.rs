@@ -1,6 +1,10 @@
-use std::sync::Arc;
+pub mod config;
+
 use matching_core::core::exchange::{ExchangeConfig, ExchangeCore, ExchangeState};
-use matching_core::{CoreSymbolSpecification, OrderAction, OrderCommand, OrderCommandType, OrderType, SymbolType};
+use matching_core::{
+    CoreSymbolSpecification, OrderAction, OrderCommand, OrderCommandType, OrderType, SymbolType,
+};
+use std::sync::Arc;
 
 fn main() {
     let config = ExchangeConfig::default();
@@ -95,7 +99,11 @@ fn main() {
         order_type: OrderType::FokBudget,
         ..Default::default()
     });
-    println!("  结果: {:?}, 事件数: {}", fok_result.result_code, fok_result.matcher_events.len());
+    println!(
+        "  结果: {:?}, 事件数: {}",
+        fok_result.result_code,
+        fok_result.matcher_events.len()
+    );
 
     // 3. 测试重复订单 ID
     println!("\n测试重复订单 ID:");
@@ -123,7 +131,11 @@ fn main() {
         order_type: OrderType::Gtc,
         ..Default::default()
     });
-    println!("  重复订单结果: {:?}, 事件数: {}", dup_result.result_code, dup_result.matcher_events.len());
+    println!(
+        "  重复订单结果: {:?}, 事件数: {}",
+        dup_result.result_code,
+        dup_result.matcher_events.len()
+    );
 
     // 4. 测试移动订单
     println!("\n测试移动订单:");
@@ -211,7 +223,9 @@ fn main() {
         ..Default::default()
     });
 
-    core_wal.enable_journaling(journal_path).expect("启用 WAL 失败");
+    core_wal
+        .enable_journaling(journal_path)
+        .expect("启用 WAL 失败");
 
     println!("提交 WAL 记录的命令...");
     core_wal.submit_command(OrderCommand {
@@ -241,7 +255,9 @@ fn main() {
         ..Default::default()
     });
 
-    core_recovered.replay_journal(journal_path).expect("重放 WAL 失败");
+    core_recovered
+        .replay_journal(journal_path)
+        .expect("重放 WAL 失败");
     println!("WAL 恢复成功");
 
     // 清理测试文件
@@ -255,7 +271,9 @@ fn main() {
     let _ = std::fs::remove_dir_all(snapshot_dir);
 
     let mut core_snap = ExchangeCore::new(ExchangeConfig::default());
-    core_snap.enable_snapshotting(snapshot_dir).expect("启用快照失败");
+    core_snap
+        .enable_snapshotting(snapshot_dir)
+        .expect("启用快照失败");
 
     core_snap.add_symbol(CoreSymbolSpecification {
         symbol_id: 300,
@@ -274,7 +292,9 @@ fn main() {
 
     println!("从快照目录恢复到新核心...");
     let mut core_restored = ExchangeCore::new(ExchangeConfig::default());
-    core_restored.enable_snapshotting(snapshot_dir).expect("新核心启用快照失败");
+    core_restored
+        .enable_snapshotting(snapshot_dir)
+        .expect("新核心启用快照失败");
 
     let recovered = core_restored.load_latest_snapshot().expect("加载快照失败");
     assert!(recovered, "未找到有效的快照");
