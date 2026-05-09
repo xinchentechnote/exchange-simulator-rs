@@ -1,3 +1,4 @@
+pub mod base_info_service;
 pub mod config;
 
 use matching_core::core::exchange::{ExchangeConfig, ExchangeCore, ExchangeState};
