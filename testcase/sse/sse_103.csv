@@ -1,0 +1,3 @@
+StepId,Pbu,SetID,ReportIndex,BizID,ExecType,BizPbu,ClOrdID,SecurityID,Account,OwnerType,OrderEntryTime,LastPx,LastQty,GrossTradeAmt,Side,OrderQty,LeavesQty,OrdStatus,CreditTag,ClearingFirm,BranchID,TrdCnfmID,OrdCnfmID,TradeDate,TransactTime,UserInfo
+report_001,pbu002,0,0,010,F,pbu002,c10002,600000,10002,0,0,10,100,0,2,100,0,0,1,,b002,,,20250106,20250106101605,u000456
+report_002,pbu001,0,0,010,F,pbu001,c10001,600000,10001,0,0,10,100,0,1,100,0,0,1,,b001,,,20250106,20250106101530,u000123

@@ -1,0 +1,3 @@
+StepId,BizID,BizPbu,ClOrdID,SecurityID,Account,OwnerType,Side,Price,OrderQty,OrdType,TimeInForce,TransactTime,CreditTag,ClearingFirm,BranchID,UserInfo
+new_order_001,010,pbu001,c10001,600000,10001,1,1,10,100,1,0,20250106101530,1,1001,b001,u000123
+new_order_002,010,pbu002,c10002,600000,10002,1,2,10,100,1,0,20250106101605,1,1002,b002,u000456
