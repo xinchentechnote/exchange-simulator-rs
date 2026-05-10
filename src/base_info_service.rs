@@ -58,7 +58,7 @@ pub fn load_symbol_info(path: &str) -> Vec<CoreSymbolSpecification> {
 pub struct UserBalance {
     //uid,currency,amount
     pub uid: u64,
-    pub balance: i32,
+    pub currency: i32,
     pub amount: i64,
 }
 
@@ -78,7 +78,7 @@ pub fn load_account_info(path: &str) -> Vec<UserBalance> {
         let fields: Vec<&str> = line.split(",").collect();
         let user_balance = UserBalance {
             uid: fields[0].parse().unwrap_or(0),
-            balance: fields[1].parse().unwrap_or(0),
+            currency: fields[1].parse().unwrap_or(0),
             amount: fields[2].parse().unwrap_or(0),
         };
         result.push(user_balance);
