@@ -327,7 +327,7 @@ dependencies = [
 [[package]]
 name = "matching-core"
 version = "0.2.0"
-source = "git+https://github.com/xinchentechnote/matching-core.git?tag=v0.1.0#2cb21c0a67b34b01ad97e2394a649fc77e33aa8b"
+source = "git+https://github.com/xinchentechnote/matching-core.git?tag=v0.2.1#8d161a3661f9ead612c14b1dac689c095b9a46a3"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",

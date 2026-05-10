@@ -35,8 +35,8 @@ fn main() {
         core.submit_command(OrderCommand {
             command: OrderCommandType::BalanceAdjustment,
             uid: user_balance.uid,
-            symbol: user_balance.balance,
-            price: user_balance.amount,
+            balance: user_balance.balance,
+            amount: user_balance.amount,
             ..Default::default()
         });
     });
