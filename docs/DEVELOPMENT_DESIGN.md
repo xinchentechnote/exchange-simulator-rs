@@ -257,8 +257,8 @@ pub struct OrderRequest {
 
 设计决策：
 
-1. **action 语义修正**：按 SSE 惯例 `1=买入 / 2=卖出`。现状代码 `"1"→Ask` 与惯例相反（ARCHITECTURE P0-1），阶段一修正；文档与 `/place` 调用方同步通告。
-2. **reserve_price 策略**：None → 取 `price`（限价单冻结额即 `size×price×quote_scale_k+fee`，因撮合只会以不劣于限价的价格成交，安全）；显式给定时必须 `>= price`（买单），否则 400。预算单（FOK_BUDGET 等）语义相反（price 即预算上限），校验规则随之调整。
+1. **action 语义修正**：按 SSE 惯例 `1=买入 / 2=卖出`。✅ 已按此语义修复（P0-1，2026-10-06）；**接口语义变更需通告调用方**。完整字段校验（validator 派生、Option 化）仍在阶段一（T1.1）。
+2. **reserve_price 策略**：None → 取 `price`（限价单冻结额即 `size×price×quote_scale_k+fee`，因撮合只会以不劣于限价的价格成交，安全）；显式给定时必须 `>= price`（买单），否则 400。预算单（FOK_BUDGET 等）语义相反（price 即预算上限），校验规则随之调整。**P0 修复已先以「字段为 0 时按委托价冻结」的等价规则落地**（DTO 仍是必填 u64，Option 化调整在 T1.1）。
 3. `order_id`/`user_id`/`symbol` 的存在性校验（账户已注册、标的已加载）不在 DTO 层做——由核心风控给出权威结果码，接入层透传。
 
 ### 4.3 `handle.rs` — axum 路由与 handler

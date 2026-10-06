@@ -304,13 +304,13 @@ Content-Type: application/json
 {
   "order_id": 1,          // u64，客户端自定义订单号（无去重校验）
   "user_id": 10001,       // u64，账户（必须已在账户 CSV 中引导）
-  "action": "1",          // ⚠️ 现状："1"=卖(Ask)，其他一律按买(Bid)且无校验；
-                          //    目标语义（详见开发设计文档 §4.2）：1=买(Bid)、2=卖(Ask)，非法值 400
-  "order_type": "GTC",    // ⚠️ 当前被忽略，固定 Gtc
+  "action": "1",          // 1=买(Bid)、2=卖(Ask)，其他值返回 400（P0-1 已修复）
+  "order_type": "GTC",    // GTC/IOC/FOK/FOK_BUDGET/IOC_BUDGET/POST_ONLY/DAY/GTD:<unix_ts>；
+                          // 非法值 400，STOP_LIMIT/STOP_MARKET/ICEBERG 暂不支持（P0-4 已修复）
   "price": 1000,          // i64，限价
   "size": 100,            // i64，数量（股）
   "symbol": 600000,       // i32，标的代码
-  "reserve_price": 1000   // u64，买单资金冻结预留价（未填时注意默认 0 会导致买单冻结不足）
+  "reserve_price": 1000   // u64，买单资金冻结预留价；填 0 表示按委托价冻结（P0 修复附带）
 }
 
 响应: 200  true   （仅表示命令已入队，非撮合结果）
@@ -422,7 +422,9 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 
 以下按优先级列出本次走查发现的问题，供后续迭代排期。
 
-### P0（影响正确性/可观测性，建议尽快修复）
+### P0（影响正确性/可观测性）
+
+> **2026-10-06 更新：P0-1 ~ P0-4 已全部修复**（`src/handle.rs` 重写 + `main.rs` 日志初始化，经冒烟验证），下表保留作为变更记录。
 
 | # | 位置 | 问题 | 建议 |
 |---|------|------|------|
@@ -495,11 +497,10 @@ cargo test
 # 启动（监听 127.0.0.1:8080，加载 data/sse/*.csv，结果打印到 stdout）
 cargo run
 
-# 下单示例（账户 10001 买 600000，价格 1000 分 x 100 股）
-# action 语义：1=买入、2=卖出（SSE 惯例；现状代码恰好相反，修复跟踪见问题 P0-1）
+# 下单示例（账户 10001 买 600000，价格 1000 分 x 100 股；action：1=买入、2=卖出）
 curl -X POST http://127.0.0.1:8080/place \
   -H 'Content-Type: application/json' \
-  -d '{"order_id":1,"user_id":10001,"action":"2","order_type":"GTC",
+  -d '{"order_id":1,"user_id":10001,"action":"1","order_type":"GTC",
        "price":1000,"size":100,"symbol":600000,"reserve_price":1000}'
 
 # 观察结果：服务端 stdout 输出 result: PlaceOrder - Success
