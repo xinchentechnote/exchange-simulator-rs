@@ -1,0 +1,3 @@
+StepId,SenderCompId,TargetCompId,HeartBtInt,Password,DefaultApplVerId
+logon_001,szoms01,szsim01,10,,
+logon_002,szsim01,szoms01,10,,

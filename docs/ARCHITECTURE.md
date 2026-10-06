@@ -70,7 +70,7 @@
 - **测试工具**：`gt-auto`（外部工具，见 `autotest.sh`）按 `testcase/sse/*.csv` 场景脚本驱动报文的发送与接收校验。
 - **依赖仓库**（均为 GitHub tag 固定版本，构建时需可访问）：
   - `matching-core`（撮合核心，v0.2.2）
-  - `sse-binary` / `binary-codec`（SSE 二进制协议编解码，v0.1.0，**尚未接线使用**）
+  - `sse-binary` / `szse-binary` / `binary-codec`（SSE/SZSE 二进制协议编解码，v0.1.0）
 
 ---
 
@@ -86,7 +86,8 @@
 | `validator` | 0.20（derive） | HTTP DTO 字段校验 | ✅ 使用中 |
 | `bytes` | 1.x | 网关帧缓冲 | ✅ 使用中 |
 | `sse-binary` | git tag v0.1.0 | SSE 二进制协议报文编解码（网关） | ✅ 使用中（阶段二） |
-| `binary-codec` | git tag v0.1.0 | sse-binary 的底层编解码运行时（含校验和服务） | ✅ 使用中（阶段二） |
+| `binary-codec` | git tag v0.1.0 | sse/szse-binary 的底层编解码运行时（含校验和服务） | ✅ 使用中 |
+| `szse-binary` | git tag v0.1.0 | SZSE 二进制协议报文编解码（网关） | ✅ 使用中（阶段三 T3.4） |
 
 **语言版本**：Rust edition 2024（需 rustc 1.85+）。
 
@@ -369,6 +370,18 @@ gt-auto (测试工具)                     exchange-simulator-rs
 
 测试场景编排（`testcase/sse/sse_test_case.csv`）按 `case_id/step_id/action_type(Send|Receive)/msg_type` 驱动，字段模板在 `sse_40.csv`（Logon）、`sse_58.csv`（新订单：ClOrdID/SecurityID/Side/Price/OrderQty…）、`sse_32.csv`（确认：OrdStatus/LeavesQty…）、`sse_103.csv`（成交：LastPx/LastQty/GrossTradeAmt…）。
 
+### 9.3 已实现：SZSE 二进制协议网关（阶段三 T3.4，2026-10-06）
+
+`src/szse_gateway/` 与 SSE 网关架构一致，差异点：
+
+- **帧格式**：`msg_type(u32) + body_length(u32) + body + checksum(i32)`（8B 头，无序列号字段），大端序，校验和同为字节累加 mod 256；
+- **报文**：NewOrder(100101 等按 ApplID 分族) → `PlaceOrder`；OrderCancelRequest(190007) → `CancelOrder`；回报 ExecutionConfirm(200102，受理/撤单确认)、ExecutionReport(200115，成交流水)、BusinessReject(4，拒单)、CancelReject(290008)；
+- **宽松登录**：业务报文不强制先登录（gt-auto 的 SZSE 参考场景无 Logon 步骤），收到 Logon 幂等应答；
+- **无账户字段**：SZSE 撤单报文不含账户，uid 从网关订单注册表回查；
+- **校验限制**：gt-auto 对 ExecutionReport 不构建 ApplExtend 期望（恒 nil），场景中报告步骤只消费不校验，字段断言由 Rust 端到端测试覆盖；
+- 场景：`testcase/szse/`（szse_001 受理确认 / szse_002 双边成交 / szse_003 业务拒绝 / szse_004 撤单+撤拒），`gt-auto --config testcase/szse/gw-auto-szse.toml --casePath testcase/szse/szse_test_case.csv`（4 场景 10 步校验全绿）；
+- SZSE 市场实例：`[szse].enabled=true`，HTTP 8081 / 协议网关 9011，标的（000xxx）与账户（20001+）与 SSE 完全隔离。
+
 ---
 
 ## 10. 关键流程
@@ -437,8 +450,8 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 |------|------|----------|
 | 单元测试 | `config`（解析/核心参数映射）、`base_info_service`（CSV 正常/注释/CRLF/坏字段/重复/空文件）、`model`（validator 校验）、`handle`（action/order_type 映射）、`errors`（状态码映射）、`core_bridge`（不可用/幂等）、`codec`（帧往返/粘包/半包/未知类型/超长/截断防护）、`adapter`（字段映射/非法值拒绝）——共 37 例 | `cargo test`（fixture 写入临时目录，不依赖工作目录） |
 | 集成测试 | 真实撮合核心端到端 5 例：挂单冻结、成交双边结算（余额精确断言）、资金不足 RiskNsf、order_id 幂等、核心不可用 | `cargo test --test integration_test` |
-| 协议端到端 | TCP 客户端模拟 gt-auto 全流程 4 例：登录回执、下单→Confirm→双方 Report、撤单 Confirm/CancelReject、拒单 reason、心跳应答、重复订单号 | `cargo test --test sse_gateway_test` |
-| 场景测试 | `testcase/sse/sse_test_case.csv`：sse_001（登录→下单→确认→成交回报）、sse_002（撤单成功+撤单被拒）、sse_003（未知账户拒单 1001）、sse_004（心跳+重复订单号 1006）——**4 场景 14 个校验步骤全部通过（2026-10-06）** | `./autotest.sh` → 外部 `gt-auto` 工具，`testcase/sse/gw-auto-sse.toml` 定义 OMS 模拟端（`localhost:9010`，协议 binary-sse） |
+| 协议端到端 | TCP 客户端模拟 gt-auto 全流程：SSE 4 例（登录回执、下单→Confirm→双方 Report、撤单 Confirm/CancelReject、拒单 reason、心跳应答、重复订单号）+ SZSE 3 例（登录回执、受理确认+双边成交流水、撤单 Confirm/CancelReject、BusinessReject、心跳） | `cargo test --test sse_gateway_test` / `--test szse_gateway_test` |
+| 场景测试 | SSE：sse_001~004（14 个校验步骤）+ SZSE：szse_001~004（10 个校验步骤）——**均全绿（2026-10-06）** | `./autotest.sh`（SSE）/ `gt-auto --config testcase/szse/gw-auto-szse.toml --casePath testcase/szse/szse_test_case.csv`（SZSE） |
 | CI | GitHub Actions：`cargo fmt --check` → `clippy -D warnings` → `test` → `build --release` | `.github/workflows/ci.yml` |
 
 ---
@@ -505,10 +518,11 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 2. ~~协议适配层：`NewOrderSingle → PlaceOrder`（Side/OrdType/价格数量字段映射）、结果事件 → `Confirm/Report/OrderReject` 回报（字段回填规则已按 gt-auto 模板校验校准）~~；
 3. ~~与 `gt-auto` 场景测试打通（sse_001 全流程 + 新增 sse_002~004，14 个校验步骤全绿）~~。
 
-### 阶段三：多市场与状态持久化
-1. 按 `conf/config.toml` 实例化多个交易所（SSE/SZSE 各一个 `ExchangeCore` 或分片），统一进程内路由；
-2. 启用 WAL + 快照，实现"重启恢复至最新状态"（matching-core 能力已在，需接 `enable_journaling/enable_snapshotting` 与启动重放）；
-3. 订单/成交持久化存储，支持对账查询接口。
+### 阶段三：多市场与状态持久化（已拆解为 T3.1~T3.5，详见开发设计文档 §10）
+1. ~~多实例：SZSE 市场已启用（`[szse].enabled=true`，HTTP 8081 + SZSE 网关 9011，与 SSE 实例完全隔离）~~（T3.4 ✅ 2026-10-06）；
+2. 持久化：WAL + 快照，恢复采用**快照 seq 过滤重放**（matching-core WAL 无轮转 API，需跳过快照前命令防双重应用）；恢复路径跳过 CSV 引导、恢复后重新 startup()（T3.1/T3.2 待实施）；
+3. 流水与对账：订单/成交流水 JSONL 持久化 + `/trades`、`/admin/state` 查询接口（T3.3 待实施）；
+4. ~~SZSE 协议网关：接入 `fin-proto-szse-bin-rs`，gt-auto `binary-szse` 场景打通~~（T3.4 ✅）；多实例并存回归验证（T3.5 待实施）。
 
 ### 阶段四：仿真增强
 - 行情模拟（L2 快照发布、`OrderBookRequest` 查询接入）；

@@ -1,0 +1,2 @@
+StepId,ApplID,TransactTime,SubmittingPBUID,SecurityID,SecurityIDSource,RefSeqNum,RefMsgType,BusinessRejectRefID,BusinessRejectReason,BusinessRejectText
+szse003_reject_001,010,20250101130000,b0001,000001,102,0,100101,c90001,1001,AuthInvalidUser

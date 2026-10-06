@@ -22,9 +22,12 @@ pub struct ExchangeConf {
     pub enabled: bool,
     /// HTTP 下单接口监听端口
     pub server_port: u16,
-    /// SSE 二进制协议网关端口（阶段二启用）
+    /// 协议网关端口
     #[serde(default)]
     pub gateway_port: Option<u16>,
+    /// 协议网关类型："sse"（默认）| "szse"
+    #[serde(default)]
+    pub gateway_protocol: Option<String>,
     pub matcher: MatcherConf,
 }
 
@@ -124,12 +127,16 @@ mod tests {
         assert!(config.sse.enabled);
         assert_eq!(config.sse.server_port, 8080);
         assert_eq!(config.sse.gateway_port, Some(9010));
+        assert_eq!(config.sse.gateway_protocol.as_deref(), Some("sse"));
         assert_eq!(
             config.sse.matcher.symbol_info_path,
             "data/sse/symbol_data.csv"
         );
-        assert!(!config.szse.enabled);
-        assert_eq!(config.szse.server_port, 9011);
+        // 阶段三：SZSE 市场启用（HTTP 8081 / 网关 9011）
+        assert!(config.szse.enabled);
+        assert_eq!(config.szse.server_port, 8081);
+        assert_eq!(config.szse.gateway_port, Some(9011));
+        assert_eq!(config.szse.gateway_protocol.as_deref(), Some("szse"));
     }
 
     #[test]

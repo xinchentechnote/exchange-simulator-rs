@@ -1,0 +1,10 @@
+# how long a Receive step waits for a message before giving up (milliseconds)
+receive_timeout_ms = 3000
+
+[[simulators]]
+name = "szse_bin_oms_1"
+type = "oms"
+communication = "tcp"
+protocol = "binary-szse"
+server_address = "localhost:9011"
+auto_start = false

@@ -66,6 +66,8 @@ pub struct OrderRecord {
     pub action: OrderAction,
     pub order_type: OrderType,
     pub price: i64,
+    /// 买单冻结预留价（撤单解冻计算用）
+    pub reserve_price: i64,
     pub size: i64,
     pub filled_qty: i64,
     pub leaves_qty: i64,
@@ -210,8 +212,51 @@ fn route_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
                 *shared.balances.entry((cmd.uid, cmd.currency)).or_insert(0) += cmd.amount;
             }
         }
+        OrderCommandType::CancelOrder => on_cancel_result(shared, specs, cmd),
         _ => {}
     }
+}
+
+/// 撤单解冻镜像：按业务语义全额解冻剩余量（本金 + 手续费）。
+///
+/// 注意：matching-core v0.2.2 撤单产出的 Reject 事件 `bidder_hold_price=0`，
+/// 其 R2 结算对买单只退手续费不退本金（上游缺陷）；镜像按正确语义计算，
+/// 因此余额镜像可能高于核心内部冻结口径（核心偏保守，风险方向安全）。
+fn on_cancel_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
+    if cmd.result_code != CommandResultCode::Success {
+        return;
+    }
+    let spec = specs.lock().unwrap().get(&cmd.symbol).cloned();
+    let mut shared = shared.lock().unwrap();
+    let Some(spec) = &spec else { return };
+    let (uid, currency, remaining, refund) = {
+        let Some(rec) = shared.registry.get_mut(&cmd.order_id) else {
+            return; // 非网关/HTTP 渠道订单或已淘汰
+        };
+        let remaining = rec.leaves_qty;
+        let refund = match rec.action {
+            OrderAction::Ask => remaining * spec.base_scale_k,
+            OrderAction::Bid => {
+                let reserve =
+                    if matches!(rec.order_type, OrderType::FokBudget | OrderType::IocBudget) {
+                        rec.price
+                    } else {
+                        rec.reserve_price
+                    };
+                remaining * reserve * spec.quote_scale_k + remaining * spec.taker_fee
+            }
+        };
+        let currency = match rec.action {
+            OrderAction::Bid => spec.quote_currency,
+            OrderAction::Ask => spec.base_currency,
+        };
+        rec.leaves_qty = 0;
+        rec.status = OrderStatus::Filled;
+        (rec.uid, currency, remaining, refund)
+    };
+    *shared.balances.entry((uid, currency)).or_insert(0) += refund;
+    drop(shared);
+    info!(order_id = cmd.order_id, refund, "撤单解冻");
 }
 
 fn on_place_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
@@ -354,6 +399,11 @@ fn on_place_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
         action: cmd.action,
         order_type: cmd.order_type,
         price: cmd.price,
+        reserve_price: if matches!(cmd.order_type, OrderType::FokBudget | OrderType::IocBudget) {
+            cmd.price
+        } else {
+            cmd.reserve_price
+        },
         size: cmd.size,
         filled_qty,
         leaves_qty,

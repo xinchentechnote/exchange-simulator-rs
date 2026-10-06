@@ -6,3 +6,4 @@ pub mod handle;
 pub mod logging;
 pub mod model;
 pub mod sse_gateway;
+pub mod szse_gateway;

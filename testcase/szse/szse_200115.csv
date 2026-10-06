@@ -1,0 +1,3 @@
+StepId,PartitionNo,ReportIndex,ApplID,ReportingPBUID,SubmittingPBUID,SecurityID,SecurityIDSource,OwnerType,ClearingFirm,TransactTime,UserInfo,OrderID,ClOrdID,QuoteMsgID,ExecID,ExecType,OrdStatus,LastPx,LastQty,LeavesQty,CumQty,Side,AccountID,BranchID
+szse002_report_001,1,0,010,,b0001,000001,102,1,1,20250101130000,u0001,,c0002,,,F,0,500,100,0,100,2,20002,b01
+szse002_report_002,1,0,010,,b0001,000001,102,1,1,20250101120000,u0001,,c0001,,,F,0,500,100,0,100,1,20001,b01

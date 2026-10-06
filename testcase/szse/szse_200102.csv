@@ -1,0 +1,5 @@
+StepId,PartitionNo,ReportIndex,ApplID,ReportingPBUID,SubmittingPBUID,SecurityID,SecurityIDSource,OwnerType,ClearingFirm,TransactTime,UserInfo,OrderID,ClOrdID,QuoteMsgID,OrigClOrdID,ExecID,ExecType,OrdStatus,OrdRejReason,LeavesQty,CumQty,Side,OrdType,OrderQty,Price,AccountID,BranchID,OrderRestrictions
+szse001_confirm_001,1,0,010,,b0001,000001,102,1,1,20250101120000,u0001,,c0001,,,,0,0,0,100,0,1,1,100,500,20001,b01,o01
+szse002_confirm_001,1,0,010,,b0001,000001,102,1,1,20250101130000,u0001,,c0002,,,,0,0,0,100,0,2,1,100,500,20002,b01,o01
+szse004_confirm_001,1,0,010,,b0001,000001,102,1,1,20250101140000,u0001,,c0005,,,,0,0,0,100,0,1,1,100,50,20001,b01,o01
+szse004_cancel_confirm_001,1,1,010,,b0001,000001,102,1,1,20250101150000,u0001,,c0005,,c0005,,4,4,0,0,0,1,1,100,50,20001,b01,o01

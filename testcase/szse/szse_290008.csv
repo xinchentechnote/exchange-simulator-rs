@@ -1,0 +1,2 @@
+StepId,PartitionNo,ReportIndex,ApplID,ReportingPBUID,SubmittingPBUID,SecurityID,SecurityIDSource,OwnerType,ClearingFirm,TransactTime,UserInfo,ClOrdID,OrigClOrdID,Side,OrdStatus,CxlRejReason,RejectText,OrderID
+szse004_cancel_reject_001,1,0,010,,b0001,000001,102,1,1,20250101160000,u0001,cx0002,c99999,1,4,1005,,

@@ -1,0 +1,23 @@
+case_id,case_title,step_id,sleep_ms,step_desc,action_type,verify_required,test_tool,msg_type,test_data
+szse_001,logon,logon_001,1000,oms send logon,Send,N,szse_bin_oms_1,1,szse_1
+szse_001,logon,logon_002,1000,oms rev logon,Receive,Y,szse_bin_oms_1,1,szse_1
+szse_001,order,szse001_new_order_001,1000,oms send new order,Send,N,szse_bin_oms_1,100101,szse_100101
+szse_001,confirm,szse001_confirm_001,1000,oms rev execution confirm,Receive,Y,szse_bin_oms_1,200102,szse_200102
+szse_002,logon,logon_001,1000,oms send logon,Send,N,szse_bin_oms_1,1,szse_1
+szse_002,logon,logon_002,1000,oms rev logon,Receive,Y,szse_bin_oms_1,1,szse_1
+szse_002,order,szse002_new_order_001,1000,oms send new order sell crossing,Send,N,szse_bin_oms_1,100101,szse_100101
+szse_002,confirm,szse002_confirm_001,1000,oms rev confirm sell,Receive,Y,szse_bin_oms_1,200102,szse_200102
+szse_002,report,szse002_report_001,1000,oms rev execution report sell,Receive,N,szse_bin_oms_1,200115,szse_200115
+szse_002,report,szse002_report_002,1000,oms rev execution report buy maker,Receive,N,szse_bin_oms_1,200115,szse_200115
+szse_003,logon,logon_001,1000,oms send logon,Send,N,szse_bin_oms_1,1,szse_1
+szse_003,logon,logon_002,1000,oms rev logon,Receive,Y,szse_bin_oms_1,1,szse_1
+szse_003,order,szse003_new_order_001,1000,oms send new order unknown account,Send,N,szse_bin_oms_1,100101,szse_100101
+szse_003,reject,szse003_reject_001,1000,oms rev business reject,Receive,Y,szse_bin_oms_1,4,szse_4
+szse_004,logon,logon_001,1000,oms send logon,Send,N,szse_bin_oms_1,1,szse_1
+szse_004,logon,logon_002,1000,oms rev logon,Receive,Y,szse_bin_oms_1,1,szse_1
+szse_004,order,szse004_new_order_001,1000,oms send new order resting,Send,N,szse_bin_oms_1,100101,szse_100101
+szse_004,confirm,szse004_confirm_001,1000,oms rev confirm,Receive,Y,szse_bin_oms_1,200102,szse_200102
+szse_004,cancel,szse004_cancel_001,1000,oms send cancel,Send,N,szse_bin_oms_1,190007,szse_190007
+szse_004,cancel_confirm,szse004_cancel_confirm_001,1000,oms rev cancel confirm,Receive,Y,szse_bin_oms_1,200102,szse_200102
+szse_004,cancel_missing,szse004_cancel_missing_001,1000,oms send cancel for missing order,Send,N,szse_bin_oms_1,190007,szse_190007
+szse_004,cancel_reject,szse004_cancel_reject_001,1000,oms rev cancel reject,Receive,Y,szse_bin_oms_1,290008,szse_290008

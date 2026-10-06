@@ -33,6 +33,7 @@ fn test_conf(dir: &std::path::Path) -> ExchangeConf {
         enabled: true,
         server_port: 0,
         gateway_port: None,
+        gateway_protocol: Some("sse".into()),
         matcher: MatcherConf {
             symbol_info_path: dir.join("symbols.csv").to_string_lossy().into_owned(),
             account_info_path: dir.join("accounts.csv").to_string_lossy().into_owned(),
@@ -202,5 +203,45 @@ fn case5_core_unavailable() {
             .execute(place_cmd(1, 10001, OrderAction::Bid, 1000, 100))
             .await;
         assert!(matches!(result, Err(SimError::CoreUnavailable)));
+    });
+}
+
+/// 用例 6：撤单解冻 —— 挂单后撤单，冻结资金应全额退回
+#[test]
+fn case6_cancel_restores_frozen_balance() {
+    run_local(async {
+        let (bridge, core_task, result_task) = bootstrap("case6").await;
+        bridge
+            .execute(place_cmd(1, 10001, OrderAction::Bid, 500, 100))
+            .await
+            .unwrap();
+        // 冻结 100×500×1 + 100×3 = 50,300（fixture 起始 10,000,000）
+        assert_eq!(bridge.balances_of(10001).get(&840), Some(&9_949_700));
+
+        let cancel = OrderCommand {
+            command: OrderCommandType::CancelOrder,
+            uid: 10001,
+            order_id: 1,
+            symbol: 600000,
+            ..Default::default()
+        };
+        bridge.submit(cancel).await.unwrap();
+        // 等待撤单结果经广播结算（最多 2s）
+        let mut restored = false;
+        for _ in 0..200 {
+            if bridge.balances_of(10001).get(&840) == Some(&10_000_000) {
+                restored = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            restored,
+            "撤单后冻结资金应全额解冻，实际 {:?}",
+            bridge.balances_of(10001)
+        );
+
+        core_task.abort();
+        result_task.abort();
     });
 }

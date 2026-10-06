@@ -66,14 +66,23 @@ async fn run(cfg: config::Config) {
             }
         }));
 
-        // SSE 二进制协议网关（阶段二）
+        // 协议网关（按 gateway_protocol 分派，默认 SSE）
         if let Some(gateway_port) = conf.gateway_port {
             let gateway_shutdown = shutdown_rx.clone();
-            gateway_tasks.push(exchange_simulator_rs::sse_gateway::spawn(
-                gateway_port,
-                bridge.clone(),
-                gateway_shutdown,
-            ));
+            let bridge_for_gw = bridge.clone();
+            let protocol = conf.gateway_protocol.as_deref().unwrap_or("sse");
+            match protocol {
+                "szse" => gateway_tasks.push(exchange_simulator_rs::szse_gateway::spawn(
+                    gateway_port,
+                    bridge_for_gw,
+                    gateway_shutdown,
+                )),
+                _ => gateway_tasks.push(exchange_simulator_rs::sse_gateway::spawn(
+                    gateway_port,
+                    bridge_for_gw,
+                    gateway_shutdown,
+                )),
+            }
         }
 
         bridges.push(bridge);

@@ -732,4 +732,37 @@ pub type SimResult<T> = Result<T, SimError>;
 | T2.4 | `report.rs` 回报生成 + OrderRegistry | §4.7.4/4.7.5 | 2.5d | T2.3 |
 | T2.5 | gt-auto 联调：sse_001 打通，补 sse_002~004 | §8.4 | 2d | T2.4 |
 
-> 阶段三（多市场实例化、WAL/快照恢复）、阶段四（行情/异常注入/压测）在完成上述两阶段后另行细化设计。
+> 阶段三（多市场实例化、WAL/快照恢复）在完成上述两阶段后另行细化设计。
+
+### 阶段三：多市场与状态持久化（约 9 人日，已拆解待实施）
+
+**前置调研结论（2026-10-06）**：
+
+1. 多实例装配循环已就绪（`main.rs` 按 `enabled` 遍历市场），SZSE 数据（标的 000xxx / 账户 20001+）与 SSE（600xxx / 10001+）无 ID 冲突，可并行实例化；
+2. **matching-core 的 WAL 无轮转/截断 API**（`Journaler` 恒为追加写，`read_commands` 读全量）：恢复不能"快照+清 WAL"，必须实现**快照 seq 过滤重放**——快照以命令序号为文件名（`snapshot_{seq}.bin`，`get_latest_seq_id()` 可查），重启时读全量 WAL 并跳过前 `seq` 条命令只重放增量，这是崩溃安全的关键；
+3. `load_latest_snapshot` 内部走 `from_state`，产出的新核心 **producer 为空且 journaler/snapshot_store 被清空**：恢复后必须重新 enable journaling/snapshotting 并再次 `startup()`，且恢复路径要**跳过 CSV 引导**（否则标的/资金双重登记）；
+4. gt-auto 支持 `binary-szse` 协议（`SzseBinFramer`：8B 头 + 4B 校验和，与 SSE 帧格式不同），SZSE 报文体系独立（`fin-proto-szse-bin-rs`：NewOrder/ExecutionConfirm/ExecutionReport/CancelReject/BusinessReject/extend_* 扩展族）。
+
+| ID | 任务 | 内容/产出 | 估算 | 依赖 |
+|----|------|-----------|------|------|
+| T3.1 | 持久化配置与接入骨架 | `[sse.matcher.persistence]` 新配置段（`wal_path`/`snapshot_dir`/`snapshot_every_n`，缺省关闭）；`bootstrap_exchange` 中 `enable_journaling`/`enable_snapshotting` 接线（**必须在 startup 前**）；核心任务内维护命令序号计数器并按周期 `take_snapshot(seq)` | 0.5d | — |
+| T3.2 | 恢复语义与启动编排（核心难点） | 双启动路径：①无快照 → CSV 引导 + 新 WAL（现状）；②有快照 → `load_latest_snapshot`（跳过 CSV 引导）→ 重新 enable journaling/snapshot → WAL 增量过滤重放（跳过前 seq 条）→ `startup()`；重放经结果消费者自然重建余额镜像/订单注册表/网关表；优雅停机时补一次 `take_snapshot`；L2 恢复测试：下单→快照→`kill -9`→重启→余额与挂单断言一致 | 2.5d | T3.1 |
+| T3.3 | 订单/成交流水持久化 + 对账查询 | 受理/拒绝/成交事件 JSONL 追加写（路径可配，写在结果路由处）；写失败策略：默认告警不阻塞撮合（可配 strict 停机）；新增 `GET /trades?symbol=&limit=`、`GET /admin/state`（订单/成交/余额汇总）；测试 | 1.5d | T3.2 |
+| T3.4 | SZSE 协议网关（可并行）✅ 已完成（2026-10-06，gt-auto binary-szse 4 场景 10 步校验全绿） | 引入 `szse-binary` v0.1.0；`src/szse_gateway/`（帧 8B 头适配、宽松登录、adapter/report 码值差异）；`[szse]` 启用（HTTP 8081 / 网关 9011，`gateway_protocol="szse"` 分派）；SZSE 场景 `testcase/szse/*`；**附带修复**：core_bridge 余额镜像补上撤单全额解冻（OrderRecord 新增 reserve_price；上游 matching-core 撤单 Reject 事件 bidder_hold_price=0 导致 R2 只退手续费不退本金，镜像按业务正确语义处理并已记录差异） | 3.5d | —（与 T3.1~T3.3 并行） |
+
+> **T3.4 实施备注**：
+> 1. SZSE 会话为**宽松登录**（业务报文不强制先登录，收到 Logon 幂等应答）——gt-auto 参考场景无 Logon 步骤；
+> 2. gt-auto 的 Go 侧对 ExecutionReport 不构建 ApplExtend 期望（恒为 nil），而我们发出的报文解码后扩展非 nil，深比较必不等——因此场景中 ExecutionReport 步骤为 `verify_required=N`（只消费不校验），成交回报字段断言由 Rust 端到端测试覆盖；
+> 3. SZSE 拒单使用 BusinessReject(4)（business_reject_reason 复用 §6.4 码值），撤单失败用 CancelReject(290008)；
+> 4. SZSE 撤单报文无账户字段，uid 从网关订单注册表回查。
+| T3.5 | 多实例并存验证 + 文档收尾 | 双市场同时启动冒烟（端口布局/市场隔离/订单号空间独立）；崩溃恢复演练纳入 autotest 或 CI；两份文档更新 | 1d | T3.2、T3.3、T3.4 |
+
+**实现前需确认的决策**：
+
+| # | 决策点 | 推荐 |
+|---|--------|------|
+| 1 | 恢复一致性策略 | 快照 seq 过滤重放（崩溃安全，T3.2 已按此设计）；简化版"停机快照+删 WAL"仅丢崩溃窗口数据，可作为降级开关 |
+| 2 | WAL 中命令范围 | 全量命令（含撤单/改单）——重放即恢复，无需区分 |
+| 3 | 流水持久化格式 | JSONL 追加写（零新依赖）；如需 SQL 对账再引入 SQLite |
+| 4 | SZSE 适配范围 | 最小集：NewOrder / OrderCancelReq / ExecutionConfirm / ExecutionReport / CancelReject / BusinessReject，extend_* 族按场景需要逐个补 |
+| 5 | SZSE 码值校验 | Confirm/Report 的 ReportIndex/OrdCnfmId 等是否沿用 SSE 校准结论，需拿到 SZSE 场景模板后确认（无模板则先按 SZSE 协议文档编写并标注待验证） |

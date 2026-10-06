@@ -63,6 +63,7 @@ async fn bootstrap_with_gateway(
         enabled: true,
         server_port: 0,
         gateway_port: None, // 测试内手动启动网关（任意端口）
+        gateway_protocol: Some("sse".into()),
         matcher: MatcherConf {
             symbol_info_path: dir.join("symbols.csv").to_string_lossy().into_owned(),
             account_info_path: dir.join("accounts.csv").to_string_lossy().into_owned(),
