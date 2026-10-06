@@ -310,13 +310,27 @@ Content-Type: application/json
   "price": 1000,          // i64，限价
   "size": 100,            // i64，数量（股）
   "symbol": 600000,       // i32，标的代码
-  "reserve_price": 1000   // u64，买单资金冻结预留价；填 0 表示按委托价冻结（P0 修复附带）
+  "reserve_price": 1000   // u64 可选，买单资金冻结预留价；缺省或 0 表示按委托价冻结
 }
 
-响应: 200  true   （仅表示命令已入队，非撮合结果）
+响应（200，同步返回撮合终态结果，`result_code` 为 CommandResultCode 枚举名）：
+
+```json
+{ "order_id": 1, "result_code": "Success", "accepted": true, "leaves_qty": 100,
+  "trades": [ {"size": 100, "price": 1000, "counterparty_order_id": 2} ] }
 ```
 
-**观察结果的当前方式**：服务端 stdout 打印 `result: <command> - <result_code>`。
+错误响应：400 invalid_request（action/order_type/reserve_price 非法）、409 duplicate_order_id、422 validation（字段校验）、503 core_unavailable、504 core_timeout。
+
+其他接口：
+
+| 方法/路径 | 说明 |
+|-----------|------|
+| `GET /orders/{order_id}` | 订单当前状态（New/PartiallyFilled/Filled/Rejected + 成交明细，含对手方回填），不存在返回 404 |
+| `GET /accounts/{uid}/balances` | 账户各币种余额（由结果事件流水推算的镜像值） |
+```
+
+> 观察结果的补充方式：服务端 stdout 仍打印 `result: <command> - <result_code>`；HTTP 响应与查询接口是主要途径。
 
 ### 9.2 规划中：SSE 二进制协议网关
 
@@ -377,13 +391,17 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
   │ POST /place      │                  │               │                  │
   ├─────────────────▶│ OrderRequest     │               │                  │
   │                  ├─ OrderCommand ──▶│               │                  │
-  │◀─ 200 true ──────┤ (受理即返回)      ├── recv() ────▶│                  │
-  │                  │                  │               ├─ publish(cmd) ──▶│
-  │                  │                  │               │                  ├─ R1: 冻结资金/校验
-  │                  │                  │               │                  ├─ Matching: 撮合, 产出 events
-  │                  │                  │               │                  ├─ R2: 双边记账/退差价
-  │                  │                  │               │                  └─ ResultConsumer: 打印
+  │◀─ 200 报告 ───────┤ (同步等待结果，5s 超时)    ├── recv() ────▶│                  │
+  │                  │                            │               │                  │
+  │                  │                            │               ├─ publish(cmd) ──▶│
+  │                  │                            │               │                  ├─ R1: 冻结资金/校验
+  │                  │                            │               │                  ├─ Matching: 撮合, 产出 events
+  │                  │                            │               │                  ├─ R2: 双边记账/退差价
+  │                  │                            │◀──────────────┴──────────────────┤ ResultConsumer: 结果路由
+  │                  │                            │  （受理/拒绝报告、订单注册表、余额镜像）│
 ```
+
+> 阶段一更新：结果不再只打印，而是经 core_bridge 结果路由回传——`/place` 同步返回终态报告，订单/余额可查询（详见开发设计文档 §4.6）。
 
 **资金安全示例**（买单全成）：冻结 `size×reserve_price×quote_scale_k + size×taker_fee` → 撮合成交价 `price` → R2 退差价 `(reserve_price−price)×size×quote_scale_k`，入 `base` 币 `size×base_scale_k`。预留价机制保证即使成交价上穿委托价也不会扣穿账户。
 
@@ -391,16 +409,16 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 
 ## 11. 配置管理
 
-**现状**：`conf/config.toml` 已具备双市场结构，但 `main.rs` 未读取，以下均为硬编码：
+**现状**：配置已全面接管（阶段一 T1.3 完成），`main.rs` 支持 `--config <path>`（默认 `conf/config.toml`）：
 
-| 配置项 | 当前值 | 位置 |
-|--------|--------|------|
-| HTTP 监听地址 | `127.0.0.1:8080` | `main.rs:71` |
-| 标的数据文件 | `data/sse/symbol_data.csv` | `main.rs:34` |
-| 账户数据文件 | `data/sse/account_data.csv` | `main.rs:40` |
-| 撮合核心参数 | `ExchangeConfig::default()`（64K ring / 1+1 分片 / BusySpin / 单生产者） | `main.rs:26` |
-
-`conf/config.toml` 规划结构（SSE 9010 / SZSE 9011，各配数据文件路径）——被 `config.rs` 的单测覆盖。
+| 配置项 | 来源 | 说明 |
+|--------|------|------|
+| HTTP 监听端口 | `[sse].server_port`（当前 8080） | 绑定 127.0.0.1 |
+| SSE 网关端口 | `[sse].gateway_port`（当前 9010，预留） | 阶段二启用 |
+| 数据文件路径 | `[sse].matcher.*_info_path` | fail-fast 加载 |
+| 撮合核心参数 | `[sse].matcher.core` | ring/分片/生产者/等待策略，缺省同 matching-core 默认 |
+| 日志级别 | `[logging].level`（可被 `RUST_LOG` 覆盖） | 默认 info |
+| 市场开关 | `[sse]/[szse].enabled` | 阶段一仅启用 sse，szse 关闭（阶段三扩展为多实例） |
 
 **持久化**：matching-core 提供 WAL（`enable_journaling`，rkyv 长度前缀帧）与快照（`enable_snapshotting`/`take_snapshot`/`load_latest_snapshot`）能力，本仓库**尚未启用**；当前进程为纯内存态，重启即回到初始 CSV 状态。
 
@@ -410,11 +428,10 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 
 | 层级 | 内容 | 运行方式 |
 |------|------|----------|
-| 单元测试 | `config`（TOML 解析）、`base_info_service`（CSV 加载，断言 41 标的 / 10 账户） | `cargo test`（须在 crate 根目录执行，依赖相对路径） |
-| 场景测试 | `testcase/sse/sse_test_case.csv` 定义 case sse_001（Logon → 新订单 → 确认 → 成交报告） | `./autotest.sh` → 调用外部 `gt-auto` 工具（需另行安装）驱动 `testcase/sse/gw-auto-sse.toml` 中定义的 OMS 模拟端（`localhost:9010`，协议 binary-sse） |
-| 集成验证 | matching-core 自带 integration_test（WAL/快照恢复） | 见 matching-core 仓库 |
-
-> 当前场景测试针对的是**规划中的 SSE 协议网关**（9010 端口）；HTTP `/place`（8080 端口）暂无自动化测试。
+| 单元测试 | `config`（解析/核心参数映射）、`base_info_service`（CSV 正常/注释/CRLF/坏字段/重复/空文件，共 12 例）、`model`（validator 校验 4 例）、`handle`（action/order_type 映射）、`errors`（状态码映射）、`core_bridge`（不可用/幂等）——共 27 例 | `cargo test`（fixture 写入临时目录，不依赖工作目录） |
+| 集成测试 | 真实撮合核心端到端 5 例：挂单冻结、成交双边结算（余额精确断言）、资金不足 RiskNsf、order_id 幂等、核心不可用 | `cargo test --test integration_test` |
+| 场景测试 | `testcase/sse/sse_test_case.csv` 定义 case sse_001（Logon → 新订单 → 确认 → 成交报告） | `./autotest.sh` → 调用外部 `gt-auto` 工具（需另行安装），针对阶段二的协议网关（9010 端口） |
+| CI | GitHub Actions：`cargo fmt --check` → `clippy -D warnings` → `test` → `build --release` | `.github/workflows/ci.yml` |
 
 ---
 
@@ -435,6 +452,8 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 
 ### P1（健壮性 / 语义一致性）
 
+> **2026-10-06 更新：P1-1 ~ P1-7 已随阶段一（T1.1~T1.6）全部修复**；P1-8 的引导顺序约束已封装进 `core_bridge::bootstrap_exchange`（结果消费者先于引导命令注册，启动后再调 `add_symbol` 的路径已不存在）。下表保留作为变更记录。
+
 | # | 位置 | 问题 | 建议 |
 |---|------|------|------|
 | P1-1 | `src/model.rs` | `OrderRequest` 无字段校验：`size<=0`、`price<=0`、`user_id=0` 等直接透传给核心 | 启用 `validator` 派生或在 handler 内校验，返回 422 |
@@ -447,6 +466,8 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 | P1-8 | `src/main.rs:26-36` | `startup()` 后 `add_symbol` 静默失效（pipeline 已被 move），生命周期约束仅存在于隐式约定 | 在 `ExchangeCore` 使用侧以类型状态/注释固化"先引导后启动"顺序，并在 startup 后调用 add_symbol 时告警 |
 
 ### P2（整洁度 / 可维护性）
+
+> **2026-10-06 更新：P2-1/P2-2/P2-3/P2-5/P2-6 已随阶段一（T1.4/T1.7）修复**（bincode/bigdecimal 移除、toml 版本号规范、警告清零、MySymbolType fail-fast、测试改用 CARGO_MANIFEST_DIR/临时目录、关键 expect 带上下文）；**P2-4（币种代码 840 vs 156）保留待需求方确认**。
 
 | # | 位置 | 问题 | 建议 |
 |---|------|------|------|
@@ -463,11 +484,13 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 
 结合现有代码骨架与预留接口，建议按以下阶段演进：
 
-### 阶段一：夯实现有 HTTP 链路（对应 P0/P1）
-1. 修复 `action` 映射、`order_type` 透传、通道断连错误处理（P0-1/3/4）；
-2. 初始化日志、接入 `conf/config.toml` 驱动端口与数据路径（P0-2、P1-2）；
-3. 结果回传：`/place` 支持同步返回 `result_code`（P1-6）；
-4. 优雅停机与启动自检（标的/账户加载结果日志汇总）。
+### 阶段一：夯实现有 HTTP 链路（对应 P0/P1）✅ 已完成（2026-10-06）
+
+1. ~~修复 `action` 映射、`order_type` 透传、通道断连错误处理（P0-1/3/4）~~；
+2. ~~初始化日志、接入 `conf/config.toml` 驱动端口与数据路径（P0-2、P1-2）~~；
+3. ~~结果回传：`/place` 同步返回 `result_code` 与成交明细，新增订单/余额查询接口（P1-6）~~；
+4. ~~优雅停机与启动自检（标的/账户加载结果日志汇总、Ctrl-C 三阶段停机）~~；
+5. ~~单测/集成测试补齐（32 例）+ CI 流水线 + 依赖清理~~。
 
 ### 阶段二：SSE 二进制协议网关
 1. 新增 `sse_gateway` 模块：tokio TCP server（按配置监听 9010）→ 帧解析（`sse_binary::SseBinary`）→ 会话管理（Logon/心跳/Logout、序列号校验）；

@@ -46,6 +46,8 @@
 
 ### 2.2 目标结构（阶段一~二完成后的 src 布局）
 
+> **落地状态**：阶段一部分已于 2026-10-06 实现（lib.rs 拆分、core_bridge/errors/logging 新增），`sse_gateway/` 待阶段二。
+
 ```
 src/
 ├── main.rs                 # 入口：参数解析 → 配置 → 日志 → 装配（§4.1）
@@ -342,6 +344,14 @@ enabled = false
 加载规则：`--config` 参数 > 默认路径 `conf/config.toml`；解析失败/必填缺失 → 启动报错退出。`server_port` 现值 9010/9011 规划给协议网关，HTTP 用 8080——阶段一改造时**同步更新 config.toml**，避免 9010 被 sse_32 测试工具占用。
 
 ### 4.6 `core_bridge.rs` — 撮合核心集成层（新增，核心模块）
+
+> **落地状态（2026-10-06，阶段一 T1.5/T1.6）**：已实现。与设计稿的差异：
+> 1. 命令通道直接传 `OrderCommand`（未引入 `CoreRequest` 包装——结果等待由 `execute` 内部的 pending 表+oneshot 完成，无需 reply 字段）；
+> 2. 结果消费者以 `try_send` 投递至 tokio mpsc（容量 4096），满则丢弃并告警（§4.6.5 的首选方案）；
+> 3. 注册表淘汰为**先进先出**（非严格 LRU），终态 order_id 不复用、容量 10 万；
+> 4. `spawn_core_task`/`spawn_result_task` 为私有函数，只持有各自所需状态（结果任务仅持 shared/specs 两个 Arc），**不持有 CoreBridge**——否则 core_task 与 result_task 会经命令/结果通道形成存活环，导致优雅停机无法收敛（冒烟阶段发现并修复）；
+> 5. 结果消费者在 `bootstrap_exchange` 中、于引导命令提交**之前**注册，保证 BalanceAdjustment 进入余额镜像；
+> 6. taker 成交会同步更新 maker 侧的订单注册表记录（filled/leaves/status/成交明细回填）。
 
 **职责**：持有 `ExchangeCore` 宿主任务；对上层提供"提交命令并等待结果"的同步语义；把 Disruptor 线程产生的结果路由回等待方；维护订单/余额查询用的只读快照。
 
@@ -685,7 +695,7 @@ pub type SimResult<T> = Result<T, SimError>;
 
 对应 ARCHITECTURE.md §14 阶段一、二（估算：1 名开发）：
 
-### 阶段一：HTTP 链路夯实（约 5.5 人日）
+### 阶段一：HTTP 链路夯实（约 5.5 人日）✅ 已完成（2026-10-06，T1.1~T1.7 全部落地）
 
 | ID | 任务 | 产出 | 估算 | 依赖 |
 |----|------|------|------|------|

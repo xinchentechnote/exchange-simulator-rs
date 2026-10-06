@@ -1,11 +1,27 @@
+# exchange-simulator-rs 配置
+# 结构说明见 docs/DEVELOPMENT_DESIGN.md §4.5
+
+[logging]
+level = "info"   # 可被环境变量 RUST_LOG 覆盖
+
 [sse]
-server_port = 9010
+enabled = true
+server_port = 8080       # HTTP 下单接口（POST /place）
+gateway_port = 9010      # SSE 二进制协议网关（阶段二启用）
 
 [sse.matcher]
 symbol_info_path = "data/sse/symbol_data.csv"
 account_info_path = "data/sse/account_data.csv"
 
+[sse.matcher.core]       # 撮合核心参数，缺省值同 matching-core 默认配置
+ring_buffer_size = 65536
+matching_engines_num = 1
+risk_engines_num = 1
+producer_type = "Single"     # Single | Multi
+wait_strategy = "BusySpin"   # BusySpin | Yielding | Blocking | Sleeping
+
 [szse]
+enabled = false          # 阶段三启用
 server_port = 9011
 
 [szse.matcher]
