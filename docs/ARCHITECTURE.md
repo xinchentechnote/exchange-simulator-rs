@@ -519,11 +519,11 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 2. ~~协议适配层：`NewOrderSingle → PlaceOrder`（Side/OrdType/价格数量字段映射）、结果事件 → `Confirm/Report/OrderReject` 回报（字段回填规则已按 gt-auto 模板校验校准）~~；
 3. ~~与 `gt-auto` 场景测试打通（sse_001 全流程 + 新增 sse_002~004，14 个校验步骤全绿）~~。
 
-### 阶段三：多市场与状态持久化（已拆解为 T3.1~T3.5，详见开发设计文档 §10）
+### 阶段三：多市场与状态持久化 ✅ 已完成（T3.1~T3.5，2026-10-06/07）
 1. ~~多实例：SZSE 市场已启用（`[szse].enabled=true`，HTTP 8081 + SZSE 网关 9011，与 SSE 实例完全隔离）~~（T3.4 ✅ 2026-10-06）；
 2. ~~持久化：WAL 故障恢复已启用（`[matcher.persistence].wal_path`）——启动时 WAL 存在即全量重放恢复（跳过 CSV 账户引导，标的仍从 CSV 注册），Journaler 每命令写后即 flush（kill -9 安全）；**上游限制**：快照仅在 startup 前可用（serialize_state 于 startup 后 panic），运行期不打快照，WAL 随重启累积（T3.1/T3.2 ✅ 2026-10-07）~~；
-3. 流水与对账：订单/成交流水 JSONL 持久化 + `/trades`、`/admin/state` 查询接口（T3.3 待实施）；
-4. ~~SZSE 协议网关：接入 `fin-proto-szse-bin-rs`，gt-auto `binary-szse` 场景打通~~（T3.4 ✅）；多实例并存回归验证（T3.5 待实施）。
+3. ~~流水与对账：订单/撤单终态 JSONL 审计（`orders_log_path`）+ `GET /trades`、`GET /admin/state`（含各币种余额合计）~~（T3.3 ✅ 2026-10-07）；
+4. ~~SZSE 协议网关：接入 `fin-proto-szse-bin-rs`，gt-auto `binary-szse` 场景打通~~（T3.4 ✅）；~~多实例并存回归：`autotest.sh` 单命令双市场回归 + `scripts/recovery_drill.sh` 恢复演练~~（T3.5 ✅ 2026-10-07）。
 
 ### 阶段四：仿真增强
 - 行情模拟（L2 快照发布、`OrderBookRequest` 查询接入）；

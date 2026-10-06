@@ -41,13 +41,15 @@ pub struct MatcherConf {
     pub persistence: PersistenceConf,
 }
 
-/// 持久化配置（T3.2）：WAL 故障恢复。
+/// 持久化配置（T3.2/T3.3）。
 /// 注意：matching-core v0.2.2 的快照仅在 startup 前可用（serialize_state 在
 /// startup 后 panic），故运行期不打快照，恢复采用纯 WAL 全量重放。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PersistenceConf {
-    /// WAL 文件路径；缺省关闭持久化
+    /// WAL 文件路径；缺省关闭故障恢复
     pub wal_path: Option<String>,
+    /// 订单/成交终态 JSONL 审计日志路径；缺省关闭
+    pub orders_log_path: Option<String>,
 }
 
 /// 撮合核心参数，映射 matching-core 的 ExchangeConfig，缺省值与其 Default 一致。

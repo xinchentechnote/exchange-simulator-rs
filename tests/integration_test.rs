@@ -204,7 +204,7 @@ fn case4_duplicate_order_id_rejected() {
 #[test]
 fn case5_core_unavailable() {
     run_local(async {
-        let (bridge, command_rx, _result_rx) = CoreBridge::new();
+        let (bridge, command_rx, _result_rx) = CoreBridge::new(None);
         drop(command_rx);
         let result = bridge
             .execute(place_cmd(1, 10001, OrderAction::Bid, 1000, 100))
@@ -273,6 +273,7 @@ fn case7_wal_recovery_restores_state() {
             core: CoreConf::default(),
             persistence: PersistenceConf {
                 wal_path: Some(wal_path.clone()),
+                orders_log_path: None,
             },
         },
     };
@@ -338,6 +339,91 @@ fn case7_wal_recovery_restores_state() {
         assert_eq!(bridge.balances_of(10001).get(&840), Some(&9_959_700));
         // taker 10002：冻结 10,000，收入 100×500−300=49,700 → 10,039,700
         assert_eq!(bridge.balances_of(10002).get(&840), Some(&10_039_700));
+
+        core_task.abort();
+        result_task.abort();
+    });
+}
+
+/// 用例 8：流水持久化与对账 —— JSONL 审计文件、/trades 环形缓冲、运行汇总
+#[test]
+fn case8_trade_audit_and_state_summary() {
+    use exchange_simulator_rs::config::PersistenceConf;
+
+    let dir = fixture_dir("case8");
+    let orders_log = dir.join("orders.jsonl").to_string_lossy().into_owned();
+    let conf = ExchangeConf {
+        enabled: true,
+        server_port: 0,
+        gateway_port: None,
+        gateway_protocol: None,
+        matcher: MatcherConf {
+            symbol_info_path: dir.join("symbols.csv").to_string_lossy().into_owned(),
+            account_info_path: dir.join("accounts.csv").to_string_lossy().into_owned(),
+            core: CoreConf::default(),
+            persistence: PersistenceConf {
+                wal_path: None,
+                orders_log_path: Some(orders_log.clone()),
+            },
+        },
+    };
+    std::fs::write(
+        dir.join("symbols.csv"),
+        format!("{SYMBOL_HEADER}600000,0,840,840,100,1,3,2,0,0\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("accounts.csv"),
+        format!("{ACCOUNT_HEADER}10001,840,10000000\n10002,840,10000000\n"),
+    )
+    .unwrap();
+
+    run_local(async {
+        let (bridge, core_task, result_task) = core_bridge::bootstrap_exchange("audit", &conf)
+            .await
+            .unwrap();
+
+        // 挂单 + 穿越卖单 → 1 笔成交
+        bridge
+            .execute(place_cmd(1, 10001, OrderAction::Bid, 500, 100))
+            .await
+            .unwrap();
+        bridge
+            .execute(place_cmd(2, 10002, OrderAction::Ask, 400, 100))
+            .await
+            .unwrap();
+
+        // 审计文件：2 行 JSON（place ×2），第二行含成交明细
+        let content = std::fs::read_to_string(&orders_log).expect("审计文件应存在");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "应有 2 条订单终态审计: {content}");
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("每行应为合法 JSON");
+            assert_eq!(v["kind"], "place");
+            assert!(v["ts"].as_i64().unwrap() > 0);
+        }
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["filled_qty"], 100);
+        assert_eq!(second["trades"].as_array().unwrap().len(), 1);
+        assert_eq!(second["trades"][0]["price"], 500);
+
+        // /trades 数据源：环形缓冲（按 symbol 过滤 + limit）
+        let all = bridge.recent_trades(None, 100);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].price, 500);
+        assert_eq!(all[0].taker_order_id, 2);
+        assert_eq!(all[0].maker_order_id, 1);
+        assert!(
+            bridge.recent_trades(Some(999999), 100).is_empty(),
+            "按标的过滤"
+        );
+
+        // 运行汇总
+        let summary = bridge.state_summary();
+        assert_eq!(summary.orders_total, 2);
+        assert_eq!(summary.trades_total, 1);
+        // 双边结算合计 = 20,000,000 − 300(taker fee) − 300(买单冻结内含手续费，成交不退)
+        assert_eq!(summary.balance_sums.get(&840), Some(&19_999_400));
 
         core_task.abort();
         result_task.abort();

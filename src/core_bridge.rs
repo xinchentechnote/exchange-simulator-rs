@@ -25,6 +25,8 @@ const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 const COMMAND_CHANNEL_CAPACITY: usize = 1024;
 /// 订单注册表容量上限，超出按先进先出淘汰；order_id 终态后不复用
 const REGISTRY_CAPACITY: usize = 100_000;
+/// 内存成交流水环形缓冲容量（供 /trades 查询；完整流水见 JSONL 审计文件）
+const TRADE_BUFFER_CAPACITY: usize = 10_000;
 
 /// 单笔成交（来自撮合事件 Trade）
 #[derive(Debug, Clone, serde::Serialize)]
@@ -32,6 +34,66 @@ pub struct TradeFill {
     pub size: i64,
     pub price: i64,
     pub counterparty_order_id: UserId,
+}
+
+/// 成交流水视图：内存环形缓冲 + JSONL 审计共用
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TradeView {
+    /// 成交时间（unix 毫秒）
+    pub ts: i64,
+    pub symbol: SymbolId,
+    /// 吃单方订单号
+    pub taker_order_id: u64,
+    /// 挂单方订单号
+    pub maker_order_id: u64,
+    /// 吃单方方向
+    pub taker_side: OrderAction,
+    pub price: i64,
+    pub size: i64,
+}
+
+/// JSONL 审计日志：每条订单终态（受理/拒绝/撤单）追加一行 JSON。
+/// 写失败仅告警不阻塞撮合（模拟器语义；对账以文件为准，允许极端情况下缺行）。
+pub struct AuditWriter {
+    writer: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+}
+
+impl AuditWriter {
+    pub fn open(path: &str) -> Arc<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path);
+        let writer = match file {
+            Ok(f) => Some(std::io::BufWriter::new(f)),
+            Err(e) => {
+                warn!(path = %path, error = %e, "审计日志打开失败，持久化已停用");
+                None
+            }
+        };
+        Arc::new(Self {
+            writer: Mutex::new(writer),
+        })
+    }
+
+    fn write_line(&self, line: &str) {
+        use std::io::Write;
+        let mut guard = self.writer.lock().unwrap();
+        let Some(w) = guard.as_mut() else { return };
+        if let Err(e) = writeln!(w, "{line}").and_then(|_| w.flush()) {
+            warn!(error = %e, "审计日志写入失败，本行丢弃");
+        }
+    }
+}
+
+/// 运行汇总（/admin/state）
+#[derive(Debug, serde::Serialize)]
+pub struct StateSummary {
+    pub orders_total: u64,
+    pub trades_total: u64,
+    pub registry_size: usize,
+    /// 各币种余额总和（全部账户合计，对账用）
+    pub balance_sums: BTreeMap<i32, i64>,
 }
 
 /// 命令的最终处理结果：受理（含挂单/成交）或拒绝
@@ -85,6 +147,12 @@ struct CoreShared {
     registry_order: VecDeque<u64>,
     /// (uid, currency) → 余额镜像：初始资金叠加结果事件流水推算
     balances: HashMap<(UserId, i32), i64>,
+    /// 成交流水环形缓冲（供 /trades 查询）
+    trades: VecDeque<TradeView>,
+    /// 终态订单计数（含拒绝）
+    orders_total: u64,
+    /// 成交笔数（Trade 事件数）
+    trades_total: u64,
 }
 
 /// 撮合核心集成层：对上层提供"提交命令并等待结果"的同步语义，
@@ -96,13 +164,17 @@ pub struct CoreBridge {
     result_broadcast: tokio::sync::broadcast::Sender<OrderCommand>,
     shared: Arc<Mutex<CoreShared>>,
     specs: Arc<Mutex<HashMap<SymbolId, CoreSymbolSpecification>>>,
+    /// JSONL 审计日志（未配置时为 None）
+    audit: Option<Arc<AuditWriter>>,
 }
 
 impl CoreBridge {
     /// 创建桥接层，返回 (桥, 命令接收端, 结果接收端)。
     /// 两个接收端分别交给 `spawn_core_task` / `spawn_result_task`；
     /// 测试场景可主动丢弃接收端以模拟核心不可用。
-    pub fn new() -> (
+    pub fn new(
+        audit: Option<Arc<AuditWriter>>,
+    ) -> (
         Arc<Self>,
         mpsc::Receiver<OrderCommand>,
         mpsc::Receiver<OrderCommand>,
@@ -116,6 +188,7 @@ impl CoreBridge {
             result_broadcast,
             shared: Arc::new(Mutex::new(CoreShared::default())),
             specs: Arc::new(Mutex::new(HashMap::new())),
+            audit,
         });
         (bridge, command_rx, result_rx)
     }
@@ -191,28 +264,71 @@ impl CoreBridge {
             .collect()
     }
 
+    /// 查询最近的成交流水（按时间正序），可按标的过滤；limit 截取最近的 N 笔
+    pub fn recent_trades(&self, symbol: Option<SymbolId>, limit: usize) -> Vec<TradeView> {
+        let shared = self.shared.lock().unwrap();
+        let mut filtered = shared
+            .trades
+            .iter()
+            .filter(|t| symbol.is_none_or(|s| t.symbol == s))
+            .cloned()
+            .collect::<Vec<_>>();
+        if filtered.len() <= limit {
+            filtered
+        } else {
+            filtered.split_off(filtered.len() - limit)
+        }
+    }
+
+    /// 运行汇总（对账用）
+    pub fn state_summary(&self) -> StateSummary {
+        let shared = self.shared.lock().unwrap();
+        let mut balance_sums: BTreeMap<i32, i64> = BTreeMap::new();
+        for ((_, currency), amount) in &shared.balances {
+            *balance_sums.entry(*currency).or_insert(0) += amount;
+        }
+        StateSummary {
+            orders_total: shared.orders_total,
+            trades_total: shared.trades_total,
+            registry_size: shared.registry.len(),
+            balance_sums,
+        }
+    }
+
     /// 结果路由：由 result_task 逐条调用。记账逻辑与 matching-core RiskEngine
     /// 的 R1 冻结 / R2 结算保持一致（镜像推算）。
     pub fn handle_result(&self, cmd: &OrderCommand) {
-        route_result(&self.shared, &self.specs, cmd);
+        route_result(&self.shared, &self.specs, self.audit.as_deref(), cmd);
     }
 }
 
 type SharedState = Arc<Mutex<CoreShared>>;
 type SpecMap = Arc<Mutex<HashMap<SymbolId, CoreSymbolSpecification>>>;
 
-/// 结果路由（自由函数）：result_task 只持有 shared/specs，
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 结果路由（自由函数）：result_task 只持有 shared/specs/audit，
 /// 不持有 CoreBridge，避免 core_task ↔ result_task 经由命令/结果通道的存活环。
-fn route_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
+fn route_result(
+    shared: &SharedState,
+    specs: &SpecMap,
+    audit: Option<&AuditWriter>,
+    cmd: &OrderCommand,
+) {
     match cmd.command {
-        OrderCommandType::PlaceOrder => on_place_result(shared, specs, cmd),
+        OrderCommandType::PlaceOrder => on_place_result(shared, specs, audit, cmd),
         OrderCommandType::BalanceAdjustment => {
             if cmd.result_code == CommandResultCode::Success {
                 let mut shared = shared.lock().unwrap();
                 *shared.balances.entry((cmd.uid, cmd.currency)).or_insert(0) += cmd.amount;
             }
         }
-        OrderCommandType::CancelOrder => on_cancel_result(shared, specs, cmd),
+        OrderCommandType::CancelOrder => on_cancel_result(shared, specs, audit, cmd),
         _ => {}
     }
 }
@@ -222,14 +338,19 @@ fn route_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
 /// 注意：matching-core v0.2.2 撤单产出的 Reject 事件 `bidder_hold_price=0`，
 /// 其 R2 结算对买单只退手续费不退本金（上游缺陷）；镜像按正确语义计算，
 /// 因此余额镜像可能高于核心内部冻结口径（核心偏保守，风险方向安全）。
-fn on_cancel_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
+fn on_cancel_result(
+    shared: &SharedState,
+    specs: &SpecMap,
+    audit: Option<&AuditWriter>,
+    cmd: &OrderCommand,
+) {
     if cmd.result_code != CommandResultCode::Success {
         return;
     }
     let spec = specs.lock().unwrap().get(&cmd.symbol).cloned();
     let mut shared = shared.lock().unwrap();
     let Some(spec) = &spec else { return };
-    let (uid, currency, _remaining, refund) = {
+    let (uid, currency, remaining, refund) = {
         let Some(rec) = shared.registry.get_mut(&cmd.order_id) else {
             return; // 非网关/HTTP 渠道订单或已淘汰
         };
@@ -256,10 +377,30 @@ fn on_cancel_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
     };
     *shared.balances.entry((uid, currency)).or_insert(0) += refund;
     drop(shared);
+    if let Some(audit) = audit {
+        audit.write_line(
+            &serde_json::json!({
+                "ts": unix_millis(),
+                "kind": "cancel",
+                "order_id": cmd.order_id,
+                "uid": cmd.uid,
+                "symbol": cmd.symbol,
+                "result_code": cmd.result_code,
+                "leaves_before": remaining,
+                "refund": refund,
+            })
+            .to_string(),
+        );
+    }
     info!(order_id = cmd.order_id, refund, "撤单解冻");
 }
 
-fn on_place_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
+fn on_place_result(
+    shared: &SharedState,
+    specs: &SpecMap,
+    audit: Option<&AuditWriter>,
+    cmd: &OrderCommand,
+) {
     let spec = specs.lock().unwrap().get(&cmd.symbol).cloned();
     let accepted = cmd.result_code == CommandResultCode::Success;
     let mut shared = shared.lock().unwrap();
@@ -298,6 +439,20 @@ fn on_place_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
                     price: event.price,
                     counterparty_order_id: event.matched_order_id,
                 });
+                // 成交流水：环形缓冲（/trades 查询）+ 计数
+                shared.trades_total += 1;
+                shared.trades.push_back(TradeView {
+                    ts: unix_millis(),
+                    symbol: cmd.symbol,
+                    taker_order_id: cmd.order_id,
+                    maker_order_id: event.matched_order_id,
+                    taker_side: cmd.action,
+                    price: event.price,
+                    size: event.size,
+                });
+                while shared.trades.len() > TRADE_BUFFER_CAPACITY {
+                    shared.trades.pop_front();
+                }
                 // maker 侧订单注册表同步更新（其成交来自本 taker 命令的事件）
                 if let Some(maker) = shared.registry.get_mut(&event.matched_order_id) {
                     maker.filled_qty += event.size;
@@ -381,7 +536,7 @@ fn on_place_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
         }
     }
 
-    // 3) 订单注册表 + 结果回传
+    // 3) 订单注册表 + 结果回传 + 审计
     let leaves_qty = (cmd.size - filled_qty).max(0);
     let status = if !accepted {
         OrderStatus::Rejected
@@ -392,6 +547,11 @@ fn on_place_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
     } else {
         OrderStatus::New
     };
+    let reserve_price = if matches!(cmd.order_type, OrderType::FokBudget | OrderType::IocBudget) {
+        cmd.price
+    } else {
+        cmd.reserve_price
+    };
     let record = OrderRecord {
         order_id: cmd.order_id,
         uid: cmd.uid,
@@ -399,11 +559,7 @@ fn on_place_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
         action: cmd.action,
         order_type: cmd.order_type,
         price: cmd.price,
-        reserve_price: if matches!(cmd.order_type, OrderType::FokBudget | OrderType::IocBudget) {
-            cmd.price
-        } else {
-            cmd.reserve_price
-        },
+        reserve_price,
         size: cmd.size,
         filled_qty,
         leaves_qty,
@@ -419,6 +575,28 @@ fn on_place_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
         {
             shared.registry.remove(&oldest);
         }
+    }
+    shared.orders_total += 1;
+    if let Some(audit) = audit {
+        audit.write_line(
+            &serde_json::json!({
+                "ts": unix_millis(),
+                "kind": "place",
+                "order_id": cmd.order_id,
+                "uid": cmd.uid,
+                "symbol": cmd.symbol,
+                "action": cmd.action,
+                "order_type": cmd.order_type,
+                "price": cmd.price,
+                "size": cmd.size,
+                "result_code": cmd.result_code,
+                "status": status,
+                "filled_qty": filled_qty,
+                "leaves_qty": leaves_qty,
+                "trades": trades,
+            })
+            .to_string(),
+        );
     }
     let report = ExecutionReport {
         order_id: cmd.order_id,
@@ -470,12 +648,13 @@ fn spawn_core_task(
 fn spawn_result_task(
     shared: SharedState,
     specs: SpecMap,
+    audit: Option<Arc<AuditWriter>>,
     result_broadcast: tokio::sync::broadcast::Sender<OrderCommand>,
     mut result_rx: mpsc::Receiver<OrderCommand>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_local(async move {
         while let Some(mut cmd) = result_rx.recv().await {
-            route_result(&shared, &specs, &cmd);
+            route_result(&shared, &specs, audit.as_deref(), &cmd);
             // 旁路广播（网关回报生成）；无订阅者时报错被忽略
             cmd.matcher_events.truncate(64);
             let _ = result_broadcast.send(cmd);
@@ -508,7 +687,13 @@ pub async fn bootstrap_exchange(
         "基础数据加载完成"
     );
 
-    let (bridge, command_rx, result_rx) = CoreBridge::new();
+    let audit = conf
+        .matcher
+        .persistence
+        .orders_log_path
+        .as_deref()
+        .map(AuditWriter::open);
+    let (bridge, command_rx, result_rx) = CoreBridge::new(audit.clone());
     // 结果消费者必须在引导命令之前注册，BalanceAdjustment 才能进入余额镜像
     core.set_result_consumer(bridge.result_consumer());
     for spec in &symbols {
@@ -574,6 +759,7 @@ pub async fn bootstrap_exchange(
     let result_task = spawn_result_task(
         bridge.shared.clone(),
         bridge.specs.clone(),
+        audit,
         bridge.result_broadcast.clone(),
         result_rx,
     );
@@ -591,7 +777,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let (bridge, command_rx, _result_rx) = CoreBridge::new();
+            let (bridge, command_rx, _result_rx) = CoreBridge::new(None);
             drop(command_rx);
             let cmd = OrderCommand {
                 command: OrderCommandType::PlaceOrder,
@@ -613,7 +799,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(tokio::task::LocalSet::new().run_until(async {
-            let (bridge, command_rx, _result_rx) = CoreBridge::new();
+            let (bridge, command_rx, _result_rx) = CoreBridge::new(None);
             let _keep_alive = command_rx; // 通道保持开启
             let cmd = |id: u64| OrderCommand {
                 command: OrderCommandType::PlaceOrder,

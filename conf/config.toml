@@ -14,8 +14,9 @@ gateway_protocol = "sse" # sse | szse
 symbol_info_path = "data/sse/symbol_data.csv"
 account_info_path = "data/sse/account_data.csv"
 
-[sse.matcher.persistence]    # WAL 故障恢复（重启后全量重放）
+[sse.matcher.persistence]    # WAL 故障恢复（重启后全量重放）+ 订单/成交流水审计
 wal_path = "data/sse/wal.log"
+orders_log_path = "data/sse/orders.jsonl"
 
 [sse.matcher.core]       # 撮合核心参数，缺省值同 matching-core 默认配置
 ring_buffer_size = 65536
@@ -36,6 +37,7 @@ account_info_path = "data/szse/account_data.csv"
 
 [szse.matcher.persistence]
 wal_path = "data/szse/wal.log"
+orders_log_path = "data/szse/orders.jsonl"
 
 [szse.matcher.core]
 ring_buffer_size = 65536

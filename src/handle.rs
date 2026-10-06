@@ -22,6 +22,8 @@ pub fn router(bridge: Arc<CoreBridge>) -> Router {
         .route("/place", post(place_order))
         .route("/orders/{order_id}", get(get_order))
         .route("/accounts/{uid}/balances", get(get_balances))
+        .route("/trades", get(get_trades))
+        .route("/admin/state", get(get_admin_state))
         .with_state(bridge)
         .layer(axum::middleware::from_fn(trace_middleware))
 }
@@ -137,6 +139,32 @@ async fn get_balances(
     Path(uid): Path<u64>,
 ) -> Json<BTreeMap<i32, i64>> {
     Json(bridge.balances_of(uid))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TradesQuery {
+    symbol: Option<i32>,
+    limit: Option<usize>,
+}
+
+/// 最近成交流水（内存环形缓冲，按时间正序；limit 截取最近 N 笔，上限 1000）
+async fn get_trades(
+    State(bridge): State<Arc<CoreBridge>>,
+    axum::extract::Query(q): axum::extract::Query<TradesQuery>,
+) -> Json<Vec<crate::core_bridge::TradeView>> {
+    let limit = q.limit.unwrap_or(100).min(1000);
+    Json(bridge.recent_trades(q.symbol, limit))
+}
+
+/// 运行汇总（对账用）
+async fn get_admin_state(State(bridge): State<Arc<CoreBridge>>) -> Json<serde_json::Value> {
+    let s = bridge.state_summary();
+    Json(serde_json::json!({
+        "orders_total": s.orders_total,
+        "trades_total": s.trades_total,
+        "registry_size": s.registry_size,
+        "balance_sums": s.balance_sums,
+    }))
 }
 
 #[cfg(test)]
