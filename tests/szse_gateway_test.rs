@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use binary_codec::BinaryCodec;
 use bytes::BytesMut;
-use exchange_simulator_rs::config::{CoreConf, ExchangeConf, MatcherConf};
+use exchange_simulator_rs::config::{CoreConf, ExchangeConf, MatcherConf, PersistenceConf};
 use exchange_simulator_rs::core_bridge::{self, CoreBridge};
 use exchange_simulator_rs::szse_gateway::codec::{decode_frame, msg_type_of};
 use exchange_simulator_rs::szse_gateway::spawn_listener;
@@ -71,6 +71,7 @@ async fn bootstrap_with_gateway(
             symbol_info_path: dir.join("symbols.csv").to_string_lossy().into_owned(),
             account_info_path: dir.join("accounts.csv").to_string_lossy().into_owned(),
             core: CoreConf::default(),
+            persistence: PersistenceConf::default(),
         },
     };
     let (bridge, core_task, result_task) =

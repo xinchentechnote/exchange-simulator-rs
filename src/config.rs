@@ -37,6 +37,17 @@ pub struct MatcherConf {
     pub account_info_path: String,
     #[serde(default)]
     pub core: CoreConf,
+    #[serde(default)]
+    pub persistence: PersistenceConf,
+}
+
+/// 持久化配置（T3.2）：WAL 故障恢复。
+/// 注意：matching-core v0.2.2 的快照仅在 startup 前可用（serialize_state 在
+/// startup 后 panic），故运行期不打快照，恢复采用纯 WAL 全量重放。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PersistenceConf {
+    /// WAL 文件路径；缺省关闭持久化
+    pub wal_path: Option<String>,
 }
 
 /// 撮合核心参数，映射 matching-core 的 ExchangeConfig，缺省值与其 Default 一致。
@@ -132,11 +143,19 @@ mod tests {
             config.sse.matcher.symbol_info_path,
             "data/sse/symbol_data.csv"
         );
+        assert_eq!(
+            config.sse.matcher.persistence.wal_path.as_deref(),
+            Some("data/sse/wal.log")
+        );
         // 阶段三：SZSE 市场启用（HTTP 8081 / 网关 9011）
         assert!(config.szse.enabled);
         assert_eq!(config.szse.server_port, 8081);
         assert_eq!(config.szse.gateway_port, Some(9011));
         assert_eq!(config.szse.gateway_protocol.as_deref(), Some("szse"));
+        assert_eq!(
+            config.szse.matcher.persistence.wal_path.as_deref(),
+            Some("data/szse/wal.log")
+        );
     }
 
     #[test]

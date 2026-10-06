@@ -229,7 +229,7 @@ fn on_cancel_result(shared: &SharedState, specs: &SpecMap, cmd: &OrderCommand) {
     let spec = specs.lock().unwrap().get(&cmd.symbol).cloned();
     let mut shared = shared.lock().unwrap();
     let Some(spec) = &spec else { return };
-    let (uid, currency, remaining, refund) = {
+    let (uid, currency, _remaining, refund) = {
         let Some(rec) = shared.registry.get_mut(&cmd.order_id) else {
             return; // 非网关/HTTP 渠道订单或已淘汰
         };
@@ -514,39 +514,61 @@ pub async fn bootstrap_exchange(
     for spec in &symbols {
         bridge.add_symbol_spec(spec.clone());
     }
+    // 标的为静态配置（不进 WAL），恢复与全新启动都需要重新注册
     for spec in symbols {
         core.add_symbol(spec);
     }
 
-    for account in &accounts {
-        let done = core.submit_command(OrderCommand {
-            command: OrderCommandType::AddUser,
-            uid: account.uid,
-            ..Default::default()
-        });
-        if done.result_code != CommandResultCode::Success {
-            anyhow::bail!(
-                "[{name}] AddUser 失败 uid={} result={:?}",
-                account.uid,
-                done.result_code
-            );
-        }
-        let done = core.submit_command(OrderCommand {
-            command: OrderCommandType::BalanceAdjustment,
-            uid: account.uid,
-            currency: account.currency,
-            amount: account.amount,
-            ..Default::default()
-        });
-        if done.result_code != CommandResultCode::Success {
-            anyhow::bail!(
-                "[{name}] BalanceAdjustment 失败 uid={} result={:?}",
-                account.uid,
-                done.result_code
-            );
+    // WAL 故障恢复（T3.2）：先开启 journaling（append 模式，重放不产生写入），
+    // 若 WAL 存在且非空则全量重放恢复状态并跳过账户引导（账户/订单都在 WAL 中）。
+    let mut recovered = false;
+    if let Some(wal) = conf.matcher.persistence.wal_path.as_deref() {
+        core.enable_journaling(wal)
+            .with_context(|| format!("开启 WAL 失败: {wal}"))?;
+        let wal_non_empty = std::path::Path::new(wal)
+            .metadata()
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        if wal_non_empty {
+            info!(exchange = name, wal = %wal, "发现 WAL，重放恢复状态");
+            core.replay_journal(wal)
+                .with_context(|| format!("WAL 重放失败: {wal}"))?;
+            recovered = true;
+            info!(exchange = name, "WAL 重放完成，跳过账户引导");
         }
     }
-    info!(exchange = name, accounts = accounts.len(), "账户引导完成");
+
+    if !recovered {
+        for account in &accounts {
+            let done = core.submit_command(OrderCommand {
+                command: OrderCommandType::AddUser,
+                uid: account.uid,
+                ..Default::default()
+            });
+            if done.result_code != CommandResultCode::Success {
+                anyhow::bail!(
+                    "[{name}] AddUser 失败 uid={} result={:?}",
+                    account.uid,
+                    done.result_code
+                );
+            }
+            let done = core.submit_command(OrderCommand {
+                command: OrderCommandType::BalanceAdjustment,
+                uid: account.uid,
+                currency: account.currency,
+                amount: account.amount,
+                ..Default::default()
+            });
+            if done.result_code != CommandResultCode::Success {
+                anyhow::bail!(
+                    "[{name}] BalanceAdjustment 失败 uid={} result={:?}",
+                    account.uid,
+                    done.result_code
+                );
+            }
+        }
+        info!(exchange = name, accounts = accounts.len(), "账户引导完成");
+    }
 
     let core_task = spawn_core_task(core, command_rx);
     let result_task = spawn_result_task(

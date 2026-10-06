@@ -438,9 +438,10 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 | 数据文件路径 | `[sse].matcher.*_info_path` | fail-fast 加载 |
 | 撮合核心参数 | `[sse].matcher.core` | ring/分片/生产者/等待策略，缺省同 matching-core 默认 |
 | 日志级别 | `[logging].level`（可被 `RUST_LOG` 覆盖） | 默认 info |
-| 市场开关 | `[sse]/[szse].enabled` | 阶段一仅启用 sse，szse 关闭（阶段三扩展为多实例） |
+| 市场开关 | `[sse]/[szse].enabled` | SSE + SZSE 均已启用（阶段三 T3.4） |
+| WAL 恢复 | `[matcher.persistence].wal_path` | 重启全量重放恢复（T3.2） |
 
-**持久化**：matching-core 提供 WAL（`enable_journaling`，rkyv 长度前缀帧）与快照（`enable_snapshotting`/`take_snapshot`/`load_latest_snapshot`）能力，本仓库**尚未启用**；当前进程为纯内存态，重启即回到初始 CSV 状态。
+**持久化（T3.1/T3.2 已启用）**：`[matcher.persistence].wal_path` 开启 WAL 故障恢复——每条命令经 rkyv 长度前缀帧追加写入并即时 flush（`kill -9` 安全）；重启时 WAL 存在且非空即**全量重放**恢复（跳过 CSV 账户引导，标的仍从 CSV 注册），恢复后继续追加写入。运行期快照因上游限制暂缓（见开发设计文档 §10 决策 #1）。**注意**：场景测试（`autotest.sh`）假定全新状态，运行前会清理 WAL。
 
 ---
 
@@ -520,7 +521,7 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 
 ### 阶段三：多市场与状态持久化（已拆解为 T3.1~T3.5，详见开发设计文档 §10）
 1. ~~多实例：SZSE 市场已启用（`[szse].enabled=true`，HTTP 8081 + SZSE 网关 9011，与 SSE 实例完全隔离）~~（T3.4 ✅ 2026-10-06）；
-2. 持久化：WAL + 快照，恢复采用**快照 seq 过滤重放**（matching-core WAL 无轮转 API，需跳过快照前命令防双重应用）；恢复路径跳过 CSV 引导、恢复后重新 startup()（T3.1/T3.2 待实施）；
+2. ~~持久化：WAL 故障恢复已启用（`[matcher.persistence].wal_path`）——启动时 WAL 存在即全量重放恢复（跳过 CSV 账户引导，标的仍从 CSV 注册），Journaler 每命令写后即 flush（kill -9 安全）；**上游限制**：快照仅在 startup 前可用（serialize_state 于 startup 后 panic），运行期不打快照，WAL 随重启累积（T3.1/T3.2 ✅ 2026-10-07）~~；
 3. 流水与对账：订单/成交流水 JSONL 持久化 + `/trades`、`/admin/state` 查询接口（T3.3 待实施）；
 4. ~~SZSE 协议网关：接入 `fin-proto-szse-bin-rs`，gt-auto `binary-szse` 场景打通~~（T3.4 ✅）；多实例并存回归验证（T3.5 待实施）。
 

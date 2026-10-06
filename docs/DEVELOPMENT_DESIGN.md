@@ -745,8 +745,8 @@ pub type SimResult<T> = Result<T, SimError>;
 
 | ID | 任务 | 内容/产出 | 估算 | 依赖 |
 |----|------|-----------|------|------|
-| T3.1 | 持久化配置与接入骨架 | `[sse.matcher.persistence]` 新配置段（`wal_path`/`snapshot_dir`/`snapshot_every_n`，缺省关闭）；`bootstrap_exchange` 中 `enable_journaling`/`enable_snapshotting` 接线（**必须在 startup 前**）；核心任务内维护命令序号计数器并按周期 `take_snapshot(seq)` | 0.5d | — |
-| T3.2 | 恢复语义与启动编排（核心难点） | 双启动路径：①无快照 → CSV 引导 + 新 WAL（现状）；②有快照 → `load_latest_snapshot`（跳过 CSV 引导）→ 重新 enable journaling/snapshot → WAL 增量过滤重放（跳过前 seq 条）→ `startup()`；重放经结果消费者自然重建余额镜像/订单注册表/网关表；优雅停机时补一次 `take_snapshot`；L2 恢复测试：下单→快照→`kill -9`→重启→余额与挂单断言一致 | 2.5d | T3.1 |
+| T3.1 | 持久化配置与接入骨架 ✅ 已完成（2026-10-07） | `[sse.matcher.persistence]` 新配置段（`wal_path`，缺省关闭）；`bootstrap_exchange` 中 `enable_journaling` 接线；~~命令序号计数器与周期快照~~（见下方设计调整） | 0.5d | — |
+| T3.2 | 恢复语义与启动编排（核心难点）✅ 已完成（2026-10-07，纯 WAL 重放方案） | **设计调整**：上游 `serialize_state` 在 `startup()` 后 panic（pipeline 被 move 进 Disruptor 闭包），**运行期/停机时均无法打快照**——恢复方案从「快照+增量重放」调整为**纯 WAL 全量重放**：启动时 WAL 存在且非空 → `replay_journal` 全量重放（结果消费者自然重建余额镜像/订单注册表）并**跳过 CSV 账户引导**（标的仍从 CSV 注册，因其不进 WAL）；全新启动 → CSV 引导（命令照常入 WAL）。Journaler 每条命令写后即 flush，`kill -9` 安全（截断尾帧自动忽略）；WAL 重放失败 fail-fast。L2 恢复测试 case7：冻结跨重启恢复 + 恢复后订单簿继续撮合；真机 kill -9 冒烟通过 | 2.5d | T3.1 |
 | T3.3 | 订单/成交流水持久化 + 对账查询 | 受理/拒绝/成交事件 JSONL 追加写（路径可配，写在结果路由处）；写失败策略：默认告警不阻塞撮合（可配 strict 停机）；新增 `GET /trades?symbol=&limit=`、`GET /admin/state`（订单/成交/余额汇总）；测试 | 1.5d | T3.2 |
 | T3.4 | SZSE 协议网关（可并行）✅ 已完成（2026-10-06，gt-auto binary-szse 4 场景 10 步校验全绿） | 引入 `szse-binary` v0.1.0；`src/szse_gateway/`（帧 8B 头适配、宽松登录、adapter/report 码值差异）；`[szse]` 启用（HTTP 8081 / 网关 9011，`gateway_protocol="szse"` 分派）；SZSE 场景 `testcase/szse/*`；**附带修复**：core_bridge 余额镜像补上撤单全额解冻（OrderRecord 新增 reserve_price；上游 matching-core 撤单 Reject 事件 bidder_hold_price=0 导致 R2 只退手续费不退本金，镜像按业务正确语义处理并已记录差异） | 3.5d | —（与 T3.1~T3.3 并行） |
 
@@ -761,8 +761,8 @@ pub type SimResult<T> = Result<T, SimError>;
 
 | # | 决策点 | 推荐 |
 |---|--------|------|
-| 1 | 恢复一致性策略 | 快照 seq 过滤重放（崩溃安全，T3.2 已按此设计）；简化版"停机快照+删 WAL"仅丢崩溃窗口数据，可作为降级开关 |
-| 2 | WAL 中命令范围 | 全量命令（含撤单/改单）——重放即恢复，无需区分 |
-| 3 | 流水持久化格式 | JSONL 追加写（零新依赖）；如需 SQL 对账再引入 SQLite |
-| 4 | SZSE 适配范围 | 最小集：NewOrder / OrderCancelReq / ExecutionConfirm / ExecutionReport / CancelReject / BusinessReject，extend_* 族按场景需要逐个补 |
-| 5 | SZSE 码值校验 | Confirm/Report 的 ReportIndex/OrdCnfmId 等是否沿用 SSE 校准结论，需拿到 SZSE 场景模板后确认（无模板则先按 SZSE 协议文档编写并标注待验证） |
+| 1 | 恢复一致性策略 | ~~快照 seq 过滤重放~~ **已调整（2026-10-07）**：上游快照仅在 startup 前可用（serialize_state 于 startup 后 panic），故采用**纯 WAL 全量重放**；代价是 WAL 随重启累积、恢复时间线性增长，待上游支持运行期快照后再引入周期快照+增量重放 |
+| 2 | WAL 中命令范围 | 全量命令（含撤单/改单）——重放即恢复，无需区分 ✅ |
+| 3 | 流水持久化格式 | JSONL 追加写（零新依赖）；如需 SQL 对账再引入 SQLite（T3.3 待实施） |
+| 4 | SZSE 适配范围 | 最小集：NewOrder / OrderCancelReq / ExecutionConfirm / ExecutionReport / CancelReject / BusinessReject，extend_* 族按场景需要逐个补 ✅ |
+| 5 | SZSE 码值校验 | Confirm 字段回填沿用 SSE 校准结论（ReportIndex 从 0 计、流水 ID 留空）；ExecutionReport 因 gt-auto ApplExtend 期望为 nil 仅消费不校验（字段断言由 Rust E2E 覆盖）✅ |

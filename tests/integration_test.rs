@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use exchange_simulator_rs::config::{CoreConf, ExchangeConf, MatcherConf};
+use exchange_simulator_rs::config::{CoreConf, ExchangeConf, MatcherConf, PersistenceConf};
 use exchange_simulator_rs::core_bridge::{self, CoreBridge, OrderStatus};
 use exchange_simulator_rs::errors::SimError;
 use matching_core::{CommandResultCode, OrderAction, OrderCommand, OrderCommandType};
@@ -38,6 +38,7 @@ fn test_conf(dir: &std::path::Path) -> ExchangeConf {
             symbol_info_path: dir.join("symbols.csv").to_string_lossy().into_owned(),
             account_info_path: dir.join("accounts.csv").to_string_lossy().into_owned(),
             core: CoreConf::default(),
+            persistence: PersistenceConf::default(),
         },
     }
 }
@@ -77,6 +78,12 @@ async fn bootstrap(name: &str) -> (Arc<CoreBridge>, JoinHandle<()>, JoinHandle<(
     core_bridge::bootstrap_exchange(name, &test_conf(&dir))
         .await
         .unwrap()
+}
+
+fn init_test_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+        .try_init();
 }
 
 fn run_local<F: std::future::Future>(fut: F) -> F::Output {
@@ -240,6 +247,97 @@ fn case6_cancel_restores_frozen_balance() {
             "撤单后冻结资金应全额解冻，实际 {:?}",
             bridge.balances_of(10001)
         );
+
+        core_task.abort();
+        result_task.abort();
+    });
+}
+
+/// 用例 7：WAL 故障恢复 —— 冻结与挂单状态跨"重启"恢复，订单簿可继续撮合
+#[test]
+fn case7_wal_recovery_restores_state() {
+    use exchange_simulator_rs::config::PersistenceConf;
+
+    init_test_logging();
+
+    let dir = fixture_dir("case7");
+    let wal_path = dir.join("wal.log").to_string_lossy().into_owned();
+    let conf = ExchangeConf {
+        enabled: true,
+        server_port: 0,
+        gateway_port: None,
+        gateway_protocol: None,
+        matcher: MatcherConf {
+            symbol_info_path: dir.join("symbols.csv").to_string_lossy().into_owned(),
+            account_info_path: dir.join("accounts.csv").to_string_lossy().into_owned(),
+            core: CoreConf::default(),
+            persistence: PersistenceConf {
+                wal_path: Some(wal_path.clone()),
+            },
+        },
+    };
+    std::fs::write(
+        dir.join("symbols.csv"),
+        format!("{SYMBOL_HEADER}600000,0,840,840,100,1,3,2,0,0\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("accounts.csv"),
+        format!("{ACCOUNT_HEADER}10001,840,10000000\n10002,840,10000000\n"),
+    )
+    .unwrap();
+
+    // 第一次"运行"：挂买单 100@500（冻结 100×500×1 + 100×3 = 50,300），随后模拟崩溃
+    // （不做优雅停机，直接丢弃任务；WAL 每条命令写后即 flush）
+    run_local(async {
+        let (bridge, core_task, result_task) = core_bridge::bootstrap_exchange("wal1", &conf)
+            .await
+            .unwrap();
+        let rpt = bridge
+            .execute(place_cmd(1, 10001, OrderAction::Bid, 500, 100))
+            .await
+            .unwrap();
+        assert_eq!(rpt.result_code, CommandResultCode::Success);
+        assert_eq!(bridge.balances_of(10001).get(&840), Some(&9_949_700));
+        core_task.abort();
+        result_task.abort();
+    });
+
+    let wal_size = std::fs::metadata(&wal_path).expect("WAL 文件应存在").len();
+    assert!(wal_size > 0, "首次运行后 WAL 应有内容");
+    eprintln!("WAL size after run1: {wal_size}");
+
+    // 第二次"运行"：同 WAL 重放恢复，验证冻结与订单簿状态，并继续撮合
+    run_local(async {
+        let (bridge, core_task, result_task) = core_bridge::bootstrap_exchange("wal2", &conf)
+            .await
+            .unwrap();
+        // 重放结果经结果通道异步入账（镜像最终一致），让出调度直至就绪
+        for _ in 0..100 {
+            if bridge.balances_of(10001).contains_key(&840) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            bridge.balances_of(10001).get(&840),
+            Some(&9_949_700),
+            "冻结状态应从 WAL 重放恢复"
+        );
+        assert_eq!(bridge.balances_of(10002).get(&840), Some(&10_000_000));
+
+        // 卖单穿过恢复的买单 → 全成（证明挂单仍在簿上），以 maker 价 500 成交
+        let rpt = bridge
+            .execute(place_cmd(2, 10002, OrderAction::Ask, 400, 100))
+            .await
+            .unwrap();
+        assert_eq!(rpt.trades.len(), 1);
+        assert_eq!(rpt.trades[0].price, 500);
+
+        // maker 10001：退差价 0，收 base 100×100=10,000 → 9,959,700
+        assert_eq!(bridge.balances_of(10001).get(&840), Some(&9_959_700));
+        // taker 10002：冻结 10,000，收入 100×500−300=49,700 → 10,039,700
+        assert_eq!(bridge.balances_of(10002).get(&840), Some(&10_039_700));
 
         core_task.abort();
         result_task.abort();
