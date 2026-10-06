@@ -318,6 +318,7 @@ dependencies = [
  "anyhow",
  "axum",
  "binary-codec",
+ "bytes",
  "matching-core",
  "serde",
  "serde_json",

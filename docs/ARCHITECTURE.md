@@ -80,12 +80,13 @@
 |------|------|------|------|
 | `matching-core` | git tag v0.2.2 | 撮合核心：风控引擎、撮合引擎、订单簿、Disruptor 流水线、WAL/快照 | ✅ 核心依赖 |
 | `axum` | 0.8.9 | HTTP 服务框架（`/place` 下单接口） | ✅ 使用中 |
-| `tokio` | 1.52.3 | 异步运行时（current_thread + LocalSet） | ✅ 使用中 |
-| `serde` / `toml` | 1.0 / 1.1 | JSON 请求解析 / TOML 配置解析 | ✅ 使用中 |
-| `tracing` | 0.1.44 | 结构化日志 | ⚠️ 已引入但**未初始化 subscriber**（见问题 P0-2） |
-| `sse-binary` | git tag v0.1.0 | SSE 二进制协议报文编解码（Logon/NewOrderSingle/Confirm/Report…） | 📦 预留未使用 |
-| `binary-codec` | git tag v0.1.0 | sse-binary 的底层编解码运行时 | 📦 预留未使用 |
-| `bincode` / `bigdecimal` / `validator` | — | — | 📦 预留未使用（可考虑移除） |
+| `tokio` | 1.52.3 | 异步运行时（current_thread + LocalSet，full 特性） | ✅ 使用中 |
+| `serde` / `serde_json` / `toml` | 1.0 / 1.x | JSON/TOML 解析 | ✅ 使用中 |
+| `tracing` + `tracing-subscriber` | 0.1 / 0.3 | 结构化日志（env-filter，RUST_LOG 可覆盖） | ✅ 使用中 |
+| `validator` | 0.20（derive） | HTTP DTO 字段校验 | ✅ 使用中 |
+| `bytes` | 1.x | 网关帧缓冲 | ✅ 使用中 |
+| `sse-binary` | git tag v0.1.0 | SSE 二进制协议报文编解码（网关） | ✅ 使用中（阶段二） |
+| `binary-codec` | git tag v0.1.0 | sse-binary 的底层编解码运行时（含校验和服务） | ✅ 使用中（阶段二） |
 
 **语言版本**：Rust edition 2024（需 rustc 1.85+）。
 
@@ -332,17 +333,23 @@ Content-Type: application/json
 
 > 观察结果的补充方式：服务端 stdout 仍打印 `result: <command> - <result_code>`；HTTP 响应与查询接口是主要途径。
 
-### 9.2 规划中：SSE 二进制协议网关
+### 9.2 已实现：SSE 二进制协议网关（阶段二，2026-10-06）
 
-`Cargo.toml` 已引入 `sse-binary` 编解码库（fin-protoc 生成），配套 `testcase/sse/` 场景与 `gt-auto` 测试工具。规划架构：
+`Cargo.toml` 引入 `sse-binary` 编解码库（fin-protoc 生成），网关模块 `src/sse_gateway/` 已实现并通过 gt-auto 真实联调。架构：
 
 ```
 gt-auto (测试工具)                     exchange-simulator-rs
 ┌──────────────┐   TCP/二进制协议    ┌──────────────────────────┐
-│ OMS 模拟端    │ ◄───────────────► │  SSE 协议网关（规划）      │
-│ gw-auto-sse  │  localhost:9010   │  报文 ↔ OrderCommand 适配  │
-└──────────────┘                   └──────────────────────────┘
+│ OMS 模拟端    │ ◄───────────────► │  sse_gateway             │
+│ gw-auto-sse  │  localhost:9010   │  codec → session → adapter│
+└──────────────┘                   │  → core_bridge → report   │
+                                   └──────────────────────────┘
 ```
+
+- 帧格式：`msg_type(u32) + msg_seq_num(u64) + msg_body_len(u32) + body + checksum(u32)`，大端序；校验和由 binary_codec 全局注册的 SsebinChecksumService（字节累加 mod 256）自动计算；
+- 会话：AwaitingLogon → Active → Closed；心跳超时断开；序列号宽容模式；Logon 幂等应答；
+- 订单：NewOrderSingle(58)→PlaceOrder、OrderCancel(61)→CancelOrder；回报 Confirm(32)/Report(103)/OrderReject(204)/CancelReject(59)，触发自 core_bridge 的结果广播；
+- 模块结构：`codec`（帧编解码）/ `session`（状态机）/ `adapter`（报文↔命令映射）/ `report`（回报生成+订单跟踪表），详见开发设计文档 §4.7。
 
 协议报文 `SseBinary` 帧：`msg_type(u32) + msg_seq_num(u64) + msg_body_len(u32) + body + checksum(u32)`，消息类型映射：
 
@@ -414,7 +421,7 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 | 配置项 | 来源 | 说明 |
 |--------|------|------|
 | HTTP 监听端口 | `[sse].server_port`（当前 8080） | 绑定 127.0.0.1 |
-| SSE 网关端口 | `[sse].gateway_port`（当前 9010，预留） | 阶段二启用 |
+| SSE 网关端口 | `[sse].gateway_port`（当前 9010，阶段二已启用） | TCP 协议接入 |
 | 数据文件路径 | `[sse].matcher.*_info_path` | fail-fast 加载 |
 | 撮合核心参数 | `[sse].matcher.core` | ring/分片/生产者/等待策略，缺省同 matching-core 默认 |
 | 日志级别 | `[logging].level`（可被 `RUST_LOG` 覆盖） | 默认 info |
@@ -428,9 +435,10 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 
 | 层级 | 内容 | 运行方式 |
 |------|------|----------|
-| 单元测试 | `config`（解析/核心参数映射）、`base_info_service`（CSV 正常/注释/CRLF/坏字段/重复/空文件，共 12 例）、`model`（validator 校验 4 例）、`handle`（action/order_type 映射）、`errors`（状态码映射）、`core_bridge`（不可用/幂等）——共 27 例 | `cargo test`（fixture 写入临时目录，不依赖工作目录） |
+| 单元测试 | `config`（解析/核心参数映射）、`base_info_service`（CSV 正常/注释/CRLF/坏字段/重复/空文件）、`model`（validator 校验）、`handle`（action/order_type 映射）、`errors`（状态码映射）、`core_bridge`（不可用/幂等）、`codec`（帧往返/粘包/半包/未知类型/超长/截断防护）、`adapter`（字段映射/非法值拒绝）——共 37 例 | `cargo test`（fixture 写入临时目录，不依赖工作目录） |
 | 集成测试 | 真实撮合核心端到端 5 例：挂单冻结、成交双边结算（余额精确断言）、资金不足 RiskNsf、order_id 幂等、核心不可用 | `cargo test --test integration_test` |
-| 场景测试 | `testcase/sse/sse_test_case.csv` 定义 case sse_001（Logon → 新订单 → 确认 → 成交报告） | `./autotest.sh` → 调用外部 `gt-auto` 工具（需另行安装），针对阶段二的协议网关（9010 端口） |
+| 协议端到端 | TCP 客户端模拟 gt-auto 全流程 4 例：登录回执、下单→Confirm→双方 Report、撤单 Confirm/CancelReject、拒单 reason、心跳应答、重复订单号 | `cargo test --test sse_gateway_test` |
+| 场景测试 | `testcase/sse/sse_test_case.csv`：sse_001（登录→下单→确认→成交回报）、sse_002（撤单成功+撤单被拒）、sse_003（未知账户拒单 1001）、sse_004（心跳+重复订单号 1006）——**4 场景 14 个校验步骤全部通过（2026-10-06）** | `./autotest.sh` → 外部 `gt-auto` 工具，`testcase/sse/gw-auto-sse.toml` 定义 OMS 模拟端（`localhost:9010`，协议 binary-sse） |
 | CI | GitHub Actions：`cargo fmt --check` → `clippy -D warnings` → `test` → `build --release` | `.github/workflows/ci.yml` |
 
 ---
@@ -492,10 +500,10 @@ Client         axum(handle.rs)        mpsc         core task        Disruptor �
 4. ~~优雅停机与启动自检（标的/账户加载结果日志汇总、Ctrl-C 三阶段停机）~~；
 5. ~~单测/集成测试补齐（32 例）+ CI 流水线 + 依赖清理~~。
 
-### 阶段二：SSE 二进制协议网关
-1. 新增 `sse_gateway` 模块：tokio TCP server（按配置监听 9010）→ 帧解析（`sse_binary::SseBinary`）→ 会话管理（Logon/心跳/Logout、序列号校验）；
-2. 协议适配层：`NewOrderSingle → PlaceOrder`（Side/OrdType/价格数量字段映射）、结果事件 → `Confirm/Report/OrderReject` 回报，注意 `ClOrdID ↔ order_id`、`Account ↔ uid` 的映射与 `reserve_price` 策略（网关默认按委托价 + 安全上浮冻结）；
-3. 与 `gt-auto` 场景测试打通（sse_001 全流程绿色）。
+### 阶段二：SSE 二进制协议网关 ✅ 已完成（2026-10-06）
+1. ~~TCP 网关（9010）→ 帧解析（`sse_binary::SseBinary`）→ 会话管理（Logon/心跳/Logout、序列号宽容校验）~~；
+2. ~~协议适配层：`NewOrderSingle → PlaceOrder`（Side/OrdType/价格数量字段映射）、结果事件 → `Confirm/Report/OrderReject` 回报（字段回填规则已按 gt-auto 模板校验校准）~~；
+3. ~~与 `gt-auto` 场景测试打通（sse_001 全流程 + 新增 sse_002~004，14 个校验步骤全绿）~~。
 
 ### 阶段三：多市场与状态持久化
 1. 按 `conf/config.toml` 实例化多个交易所（SSE/SZSE 各一个 `ExchangeCore` 或分片），统一进程内路由；

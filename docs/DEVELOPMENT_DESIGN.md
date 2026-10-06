@@ -424,6 +424,19 @@ pub(crate) async fn core_task(mut core: ExchangeCore, mut rx: mpsc::Receiver<Cor
 
 ### 4.7 `sse_gateway/` — SSE 二进制协议网关（阶段二，规划模块）
 
+> **落地状态（2026-10-06，T2.1~T2.5 完成）**：已全部实现并通过 gt-auto 真实联调
+> （4 场景 14 个 Receive 校验步骤全部 ✅）+ 4 个 Rust 端到端协议测试。与设计稿的差异/补充：
+> 1. **校验和**：binary_codec 全局已注册 `SsebinChecksumService`（字节累加 mod 256），编码自动计算，无需手工处理；
+> 2. **登录应答**：只回 Logon（sender/target 对调、其余回显），不主动发 PlatformState（避免干扰场景校验）；Logon 幂等应答（跨用例复用连接时重复登录仍回执）；gt-auto 客户端库连接时会先发一个空字段握手 Logon，服务端按普通登录处理；
+> 3. **字段回填规则（依据 gt-auto 模板校验校准）**：
+>    - `ReportIndex` 按「订单 × 报文类别」从 **0** 递增（Confirm/Report 各自独立计数）；
+>    - `OrdCnfmId`/`TrdCnfmId` 留空；
+>    - Report 仅回填成交与订单核心要素，`OwnerType=0`、`OrderEntryTime=0`、`GrossTradeAmt=0`、`ClearingFirm` 空（Confirm 则完整回显订单要素）；
+>    - 撤单成功回报 Confirm(exec_type="4")，字段回填原订单要素 + `OrigClOrdID`，时间字段取撤单请求值；
+> 4. **回报触发**：core_bridge 新增结果广播（`subscribe_results`，tokio broadcast），网关订阅后由 `report::on_place_result/on_cancel_result` 生成回报；`ReportIndex` 计数器在网关订单记录内维护；
+> 5. **撤单路径**：撤单走 `CoreBridge::submit`（不占 pending 表），结果经广播回传；仅允许撤销网关登记的订单；
+> 6. 新增拒绝原因码：**1007** 报文字段非法（适配失败）、**1008** 未登录（登录前收到业务报文，回拒并断开）。
+
 **目标**：使 `gt-auto`（OMS 模拟端）按 `testcase/sse` 场景与本模拟器完成 Logon→新订单→确认→成交报告全流程。
 
 #### 4.7.1 帧编解码（codec.rs）
@@ -600,6 +613,8 @@ pub type SimResult<T> = Result<T, SimError>;
 | `MatchingInvalidOrderSize` | 1004 |
 | `MatchingUnknownOrderId`（撤单） | 1005 |
 | 重复 order_id（网关幂等层） | 1006 |
+| 报文字段非法（适配失败） | 1007 |
+| 未登录收到业务报文 | 1008 |
 | 其他/未知 | 1999 |
 
 ---
@@ -707,7 +722,7 @@ pub type SimResult<T> = Result<T, SimError>;
 | T1.6 | 优雅停机 + 启动自检汇总日志 | §4.1 | 0.5d | T1.3 |
 | T1.7 | L1/L2 用例补齐 + CI 流水线 + 依赖清理 | §8、§9 | 1d | 全部 |
 
-### 阶段二：SSE 协议网关（约 9 人日）
+### 阶段二：SSE 协议网关（约 9 人日）✅ 已完成（2026-10-06，T2.1~T2.5 全部落地，gt-auto 4 场景 14 步校验全绿）
 
 | ID | 任务 | 产出 | 估算 | 依赖 |
 |----|------|------|------|------|

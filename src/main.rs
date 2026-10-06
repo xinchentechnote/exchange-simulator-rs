@@ -31,6 +31,7 @@ async fn run(cfg: config::Config) {
     let mut core_tasks = Vec::new();
     let mut result_tasks = Vec::new();
     let mut server_tasks = Vec::new();
+    let mut gateway_tasks = Vec::new();
 
     for (name, conf) in [("sse", &cfg.sse), ("szse", &cfg.szse)] {
         if !conf.enabled {
@@ -65,6 +66,16 @@ async fn run(cfg: config::Config) {
             }
         }));
 
+        // SSE 二进制协议网关（阶段二）
+        if let Some(gateway_port) = conf.gateway_port {
+            let gateway_shutdown = shutdown_rx.clone();
+            gateway_tasks.push(exchange_simulator_rs::sse_gateway::spawn(
+                gateway_port,
+                bridge.clone(),
+                gateway_shutdown,
+            ));
+        }
+
         bridges.push(bridge);
         core_tasks.push(core_task);
         result_tasks.push(result_task);
@@ -76,9 +87,12 @@ async fn run(cfg: config::Config) {
     }
     info!("收到停止信号，开始优雅停机");
 
-    // 1. 停止接受新请求并等待 HTTP 任务退出
+    // 1. 停止接受新请求/新会话并等待接入层任务退出
     let _ = shutdown_tx.send(true);
     for task in server_tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+    for task in gateway_tasks {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
     // 2. 关闭命令通道，撮合核心排空存量命令后退出

@@ -1,0 +1,3 @@
+StepId,BizID,BizPbu,ClOrdID,SecurityID,Account,OwnerType,Side,OrigClOrdID,TransactTime,BranchID,UserInfo
+sse002_cancel_001,010,pbu001,cx0001,600000,10001,1,1,c10005,20250106111000,b001,u000123
+sse002_cancel_missing_001,010,pbu001,cx0002,600000,10001,1,1,c99999,20250106111100,b001,u000123

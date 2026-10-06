@@ -1,0 +1,321 @@
+//! 会话状态机：AwaitingLogon → Active → Closed。
+//!
+//! - 登录前收到其他业务报文：尽力回拒单/撤拒并断开；
+//! - 心跳：回应 Heartbeat，`heart_bt_int` 秒内无任何入站报文判定超时断开；
+//! - 序列号：宽容模式，仅对回退/重复告警，不做严格拒绝；
+//! - 订单/撤单报文在独立任务中处理，读循环不因撮合等待而阻塞。
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use binary_codec::BinaryCodec;
+use bytes::BytesMut;
+use sse_binary::heartbeat::Heartbeat;
+use sse_binary::logon::Logon;
+use sse_binary::logout::Logout;
+use sse_binary::new_order_single::NewOrderSingle;
+use sse_binary::order_cancel::OrderCancel;
+use sse_binary::sse_binary::{SseBinary, SseBinaryBodyEnum};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::errors::SimError;
+
+use super::GatewayShared;
+use super::adapter;
+use super::codec::{self, FrameError};
+use super::report::{
+    self, GatewayOrderRecord, REJ_DUPLICATE_ORDER_ID, REJ_NOT_LOGGED_IN, SessionHandle,
+};
+
+/// 登录前/未携带心跳间隔时的默认超时（秒）
+const DEFAULT_HEARTBTINT_SECS: u16 = 30;
+/// 会话出站队列容量
+const OUT_QUEUE_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandleResult {
+    Continue,
+    Close,
+}
+
+struct ConnState {
+    shared: Arc<GatewayShared>,
+    handle: SessionHandle,
+    logged_on: bool,
+    heart_bt_int: u16,
+    last_in_seq: u64,
+}
+
+impl ConnState {
+    fn heartbeat_timeout(&self) -> Duration {
+        Duration::from_secs(self.heart_bt_int as u64 + 1)
+    }
+
+    async fn handle_message(&mut self, msg: SseBinary) -> HandleResult {
+        if msg.msg_seq_num > 0 {
+            if msg.msg_seq_num <= self.last_in_seq {
+                warn!(
+                    seq = msg.msg_seq_num,
+                    last = self.last_in_seq,
+                    "入站序列号回退/重复（宽容模式，继续处理）"
+                );
+            }
+            self.last_in_seq = msg.msg_seq_num;
+        }
+        match msg.body {
+            SseBinaryBodyEnum::Logon(logon) => self.on_logon(logon),
+            SseBinaryBodyEnum::Heartbeat(_) => {
+                self.handle.send(SseBinaryBodyEnum::Heartbeat(Heartbeat {}));
+                HandleResult::Continue
+            }
+            SseBinaryBodyEnum::Logout(logout) => {
+                info!(status = logout.session_status, "对端登出，关闭会话");
+                self.handle.send(SseBinaryBodyEnum::Logout(Logout {
+                    session_status: 0,
+                    text: String::new(),
+                }));
+                HandleResult::Close
+            }
+            SseBinaryBodyEnum::NewOrderSingle(nos) => {
+                if !self.logged_on {
+                    warn!("登录前收到新订单，拒绝并断开");
+                    report::send_order_reject_for_nos(&self.handle, &nos, REJ_NOT_LOGGED_IN);
+                    return HandleResult::Close;
+                }
+                self.on_new_order(nos);
+                HandleResult::Continue
+            }
+            SseBinaryBodyEnum::OrderCancel(oc) => {
+                if !self.logged_on {
+                    warn!("登录前收到撤单，拒绝并断开");
+                    report::send_cancel_reject_for_oc(&self.handle, &oc, REJ_NOT_LOGGED_IN);
+                    return HandleResult::Close;
+                }
+                self.on_cancel(oc);
+                HandleResult::Continue
+            }
+            other => {
+                warn!(
+                    msg_type = codec::msg_type_of(&other),
+                    "暂不处理的报文类型，忽略"
+                );
+                HandleResult::Continue
+            }
+        }
+    }
+
+    fn on_logon(&mut self, logon: Logon) -> HandleResult {
+        if self.logged_on {
+            // 幂等应答：gt-auto 可能跨用例复用连接再次登录
+            info!("会话已登录，重复 Logon 仍应答");
+        } else {
+            info!(
+                sender = %logon.sender_comp_id,
+                target = %logon.target_comp_id,
+                heart_bt_int = logon.heart_bt_int,
+                "会话登录"
+            );
+            self.logged_on = true;
+        }
+        self.heart_bt_int = if logon.heart_bt_int == 0 {
+            DEFAULT_HEARTBTINT_SECS
+        } else {
+            logon.heart_bt_int
+        };
+        // 应答 Logon：sender/target 对调，其余字段回显
+        self.handle.send(SseBinaryBodyEnum::Logon(Logon {
+            sender_comp_id: logon.target_comp_id.clone(),
+            target_comp_id: logon.sender_comp_id.clone(),
+            heart_bt_int: logon.heart_bt_int,
+            prtcl_version: logon.prtcl_version.clone(),
+            trade_date: logon.trade_date,
+            q_size: logon.q_size,
+        }));
+        HandleResult::Continue
+    }
+
+    fn on_new_order(&mut self, nos: NewOrderSingle) {
+        let shared = self.shared.clone();
+        let handle = self.handle.clone();
+        match adapter::new_order(&nos) {
+            Err(reason) => {
+                warn!(cl_ord_id = %nos.cl_ord_id, reason, "新订单适配失败，拒绝");
+                report::send_order_reject_for_nos(&handle, &nos, reason);
+            }
+            Ok(adapted) => {
+                let order_id = adapted.cmd.order_id;
+                {
+                    let mut registry = shared.registry.lock().unwrap();
+                    if registry.contains_key(&order_id) {
+                        warn!(order_id, "重复订单号，拒绝");
+                        report::send_order_reject(&handle, &adapted.meta, REJ_DUPLICATE_ORDER_ID);
+                        return;
+                    }
+                    // 先登记再提交，保证结果路由时记录可见
+                    registry.insert(
+                        order_id,
+                        GatewayOrderRecord {
+                            order_id,
+                            order_qty: adapted.meta.order_qty,
+                            filled_qty: 0,
+                            leaves_qty: adapted.meta.order_qty,
+                            status: crate::core_bridge::OrderStatus::New,
+                            confirm_index: 0,
+                            report_index: 0,
+                            session: handle.clone(),
+                            meta: adapted.meta.clone(),
+                        },
+                    );
+                    super::push_registry_order(&shared, order_id);
+                }
+                tokio::task::spawn_local(async move {
+                    match shared.bridge.execute(adapted.cmd).await {
+                        // Confirm/Report 由结果广播（result_loop）驱动发送
+                        Ok(_) => {}
+                        Err(SimError::DuplicateOrderId) => {
+                            shared.registry.lock().unwrap().remove(&order_id);
+                            report::send_order_reject(
+                                &handle,
+                                &adapted.meta,
+                                REJ_DUPLICATE_ORDER_ID,
+                            );
+                        }
+                        Err(e) => {
+                            warn!(order_id, error = ?e, "订单提交失败");
+                            shared.registry.lock().unwrap().remove(&order_id);
+                            report::send_order_reject(&handle, &adapted.meta, report::REJ_INTERNAL);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    fn on_cancel(&mut self, oc: OrderCancel) {
+        let shared = self.shared.clone();
+        let handle = self.handle.clone();
+        match adapter::cancel_order(&oc) {
+            Err(reason) => {
+                warn!(orig_cl_ord_id = %oc.orig_cl_ord_id, reason, "撤单适配失败，拒绝");
+                report::send_cancel_reject_for_oc(&handle, &oc, reason);
+            }
+            Ok((cmd, fields)) => {
+                if !shared.registry.lock().unwrap().contains_key(&cmd.order_id) {
+                    warn!(order_id = cmd.order_id, "撤单目标订单不存在");
+                    report::send_cancel_reject_for_oc(&handle, &oc, report::REJ_UNKNOWN_ORDER);
+                    return;
+                }
+                let meta = report::CancelMeta {
+                    session: handle.clone(),
+                    biz_id: fields.biz_id,
+                    pbu: fields.pbu,
+                    cl_ord_id: fields.cl_ord_id,
+                    orig_cl_ord_id: fields.orig_cl_ord_id,
+                    security_id: fields.security_id,
+                    branch_id: fields.branch_id,
+                    user_info: fields.user_info,
+                    trade_date: fields.trade_date,
+                    transact_time: fields.transact_time,
+                };
+                shared
+                    .pending_cancels
+                    .lock()
+                    .unwrap()
+                    .insert(cmd.order_id, meta);
+                let order_id = cmd.order_id;
+                tokio::task::spawn_local(async move {
+                    // 撤单结果经结果广播回传（on_cancel_result）
+                    if shared.bridge.submit(cmd).await.is_err() {
+                        warn!(order_id, "撤单提交失败：核心不可用");
+                        shared.pending_cancels.lock().unwrap().remove(&order_id);
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// 单个连接的处理入口：写任务 + 带心跳超时的读循环。
+pub(crate) async fn run_connection(shared: Arc<GatewayShared>, conn_id: u64, socket: TcpStream) {
+    let (socket_rd, mut socket_wr) = socket.into_split();
+    let (out_tx, mut out_rx) = mpsc::channel::<SseBinary>(OUT_QUEUE_CAPACITY);
+
+    let writer = tokio::task::spawn_local(async move {
+        while let Some(msg) = out_rx.recv().await {
+            let mut buf = BytesMut::new();
+            msg.encode(&mut buf);
+            if socket_wr.write_all(&buf).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut state = ConnState {
+        shared: shared.clone(),
+        handle: SessionHandle::new(out_tx.clone()),
+        logged_on: false,
+        heart_bt_int: DEFAULT_HEARTBTINT_SECS,
+        last_in_seq: 0,
+    };
+    let mut rd = BufReader::new(socket_rd);
+    let mut buf = BytesMut::with_capacity(4096);
+
+    loop {
+        let read = tokio::time::timeout(state.heartbeat_timeout(), rd.read_buf(&mut buf));
+        match read.await {
+            Err(_) => {
+                info!(
+                    conn_id,
+                    heart_bt_int = state.heart_bt_int,
+                    "心跳超时，断开会话"
+                );
+                break;
+            }
+            Ok(Err(e)) => {
+                warn!(conn_id, error = %e, "读错误，断开会话");
+                break;
+            }
+            Ok(Ok(0)) => {
+                info!(conn_id, "对端关闭连接");
+                break;
+            }
+            Ok(Ok(_)) => {}
+        }
+        let mut closed = false;
+        loop {
+            match codec::decode_frame(&mut buf) {
+                Ok(None) => break,
+                Ok(Some(msg)) => {
+                    if state.handle_message(msg).await == HandleResult::Close {
+                        closed = true;
+                        break;
+                    }
+                }
+                Err(FrameError::UnknownMessageType { msg_type }) => {
+                    warn!(conn_id, msg_type, "未知报文类型，跳过该帧");
+                }
+                Err(FrameError::BodyTooLarge { body_len }) => {
+                    warn!(conn_id, body_len, "超长报文，断开会话");
+                    closed = true;
+                    break;
+                }
+                Err(FrameError::MalformedBody) => {
+                    warn!(conn_id, "报文体解析异常，断开会话");
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if closed {
+            break;
+        }
+    }
+
+    drop(state);
+    drop(out_tx); // 关闭出站队列，写任务排空后退出
+    let _ = writer.await;
+    info!(conn_id, "会话结束");
+}

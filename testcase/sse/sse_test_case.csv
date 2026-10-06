@@ -7,3 +7,21 @@ sse_001,confirm,confirm_001,1000,oms rev confirm,Receive,Y,sse_bin_oms_1,32,sse_
 sse_001,confirm,confirm_002,1000,oms rev confirm,Receive,Y,sse_bin_oms_1,32,sse_32
 sse_001,report,report_001,1000,oms rev report,Receive,Y,sse_bin_oms_1,103,sse_103
 sse_001,report,report_002,1000,oms rev report,Receive,Y,sse_bin_oms_1,103,sse103
+sse_002,logon,logon_001,1000,oms send logon,Send,N,sse_bin_oms_1,40,sse_40
+sse_002,logon,logon_002,1000,oms rev logon,Receive,Y,sse_bin_oms_1,40,sse_40
+sse_002,order,sse002_order_001,1000,oms send new order,Send,N,sse_bin_oms_1,58,sse_58
+sse_002,confirm,sse002_confirm_001,1000,oms rev confirm,Receive,Y,sse_bin_oms_1,32,sse_32
+sse_002,cancel,sse002_cancel_001,1000,oms send order cancel,Send,N,sse_bin_oms_1,61,sse_61
+sse_002,cancel_confirm,sse002_cancel_confirm_001,1000,oms rev cancel confirm,Receive,Y,sse_bin_oms_1,32,sse_32
+sse_002,cancel_missing,sse002_cancel_missing_001,1000,oms send cancel for missing order,Send,N,sse_bin_oms_1,61,sse_61
+sse_002,cancel_reject,sse002_cancel_reject_002,1000,oms rev cancel reject,Receive,Y,sse_bin_oms_1,59,sse_59
+sse_003,logon,logon_001,1000,oms send logon,Send,N,sse_bin_oms_1,40,sse_40
+sse_003,logon,logon_002,1000,oms rev logon,Receive,Y,sse_bin_oms_1,40,sse_40
+sse_003,order,sse003_order_001,1000,oms send new order,Send,N,sse_bin_oms_1,58,sse_58
+sse_003,reject,sse003_reject_001,1000,oms rev order reject,Receive,Y,sse_bin_oms_1,204,sse_204
+sse_004,logon,logon_001,1000,oms send logon,Send,N,sse_bin_oms_1,40,sse_40
+sse_004,logon,logon_002,1000,oms rev logon,Receive,Y,sse_bin_oms_1,40,sse_40
+sse_004,heartbeat,sse004_heartbeat_001,1000,oms send heartbeat,Send,N,sse_bin_oms_1,33,sse_33
+sse_004,heartbeat,sse004_heartbeat_002,1000,oms rev heartbeat,Receive,Y,sse_bin_oms_1,33,sse_33
+sse_004,order,sse004_order_001,1000,oms send new order,Send,N,sse_bin_oms_1,58,sse_58
+sse_004,confirm,sse004_confirm_001,1000,oms rev confirm,Receive,Y,sse_bin_oms_1,32,sse_32

@@ -19,6 +19,8 @@ use crate::config::ExchangeConf;
 pub const EXECUTE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 结果通道容量；满时丢弃并告警（等待方有超时兜底，迟到结果仍会写入订单注册表）
 const RESULT_CHANNEL_CAPACITY: usize = 4096;
+/// 结果广播容量（网关等旁路订阅者）；订阅者消费过慢产生 Lagged 时自行告警
+const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 /// 命令通道容量（对上游形成背压）
 const COMMAND_CHANNEL_CAPACITY: usize = 1024;
 /// 订单注册表容量上限，超出按先进先出淘汰；order_id 终态后不复用
@@ -88,6 +90,8 @@ struct CoreShared {
 pub struct CoreBridge {
     command_tx: mpsc::Sender<OrderCommand>,
     result_tx: mpsc::Sender<OrderCommand>,
+    /// 结果广播：供 SSE 网关等旁路订阅者接收全部命令终态（含 matcher_events）
+    result_broadcast: tokio::sync::broadcast::Sender<OrderCommand>,
     shared: Arc<Mutex<CoreShared>>,
     specs: Arc<Mutex<HashMap<SymbolId, CoreSymbolSpecification>>>,
 }
@@ -103,13 +107,20 @@ impl CoreBridge {
     ) {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (result_tx, result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+        let (result_broadcast, _) = tokio::sync::broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
         let bridge = Arc::new(Self {
             command_tx,
             result_tx,
+            result_broadcast,
             shared: Arc::new(Mutex::new(CoreShared::default())),
             specs: Arc::new(Mutex::new(HashMap::new())),
         });
         (bridge, command_rx, result_rx)
+    }
+
+    /// 订阅全部命令终态（PlaceOrder/CancelOrder 等）。无订阅者时结果直接丢弃。
+    pub fn subscribe_results(&self) -> tokio::sync::broadcast::Receiver<OrderCommand> {
+        self.result_broadcast.subscribe()
     }
 
     /// 注册到撮合核心的结果消费者（运行在 Disruptor 消费线程，须非阻塞）。
@@ -151,6 +162,14 @@ impl CoreBridge {
             Ok(Err(_)) => Err(crate::errors::SimError::CoreUnavailable),
             Err(_) => Err(crate::errors::SimError::CoreTimeout),
         }
+    }
+
+    /// 提交命令但不等待结果（撤单等由结果广播回传的命令）。
+    pub async fn submit(&self, cmd: OrderCommand) -> Result<(), crate::errors::SimError> {
+        self.command_tx
+            .send(cmd)
+            .await
+            .map_err(|_| crate::errors::SimError::CoreUnavailable)
     }
 
     /// 查询订单当前状态
@@ -401,11 +420,15 @@ fn spawn_core_task(
 fn spawn_result_task(
     shared: SharedState,
     specs: SpecMap,
+    result_broadcast: tokio::sync::broadcast::Sender<OrderCommand>,
     mut result_rx: mpsc::Receiver<OrderCommand>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        while let Some(cmd) = result_rx.recv().await {
+        while let Some(mut cmd) = result_rx.recv().await {
             route_result(&shared, &specs, &cmd);
+            // 旁路广播（网关回报生成）；无订阅者时报错被忽略
+            cmd.matcher_events.truncate(64);
+            let _ = result_broadcast.send(cmd);
         }
         info!("结果路由任务退出");
     })
@@ -476,7 +499,12 @@ pub async fn bootstrap_exchange(
     info!(exchange = name, accounts = accounts.len(), "账户引导完成");
 
     let core_task = spawn_core_task(core, command_rx);
-    let result_task = spawn_result_task(bridge.shared.clone(), bridge.specs.clone(), result_rx);
+    let result_task = spawn_result_task(
+        bridge.shared.clone(),
+        bridge.specs.clone(),
+        bridge.result_broadcast.clone(),
+        result_rx,
+    );
     Ok((bridge, core_task, result_task))
 }
 

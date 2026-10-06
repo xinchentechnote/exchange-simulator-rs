@@ -1,0 +1,2 @@
+StepId,BizID,BizPbu,ClOrdID,SecurityID,OrdRejReason,TradeDate,TransactTime,UserInfo
+sse003_reject_001,010,pbu001,c20001,600000,1001,20250106,20250106110000,u000123

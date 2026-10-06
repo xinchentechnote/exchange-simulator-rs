@@ -1,0 +1,2 @@
+StepId,Pbu,SetID,ReportIndex,BizID,BizPbu,ClOrdID,SecurityID,OrigClOrdID,BranchID,CxlRejReason,TradeDate,TransactTime,UserInfo
+sse002_cancel_reject_002,pbu001,0,0,010,pbu001,cx0002,600000,c99999,b001,1005,20250106,20250106111100,u000123
