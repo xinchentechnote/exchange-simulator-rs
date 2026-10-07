@@ -71,6 +71,16 @@ fn place_cmd(order_id: u64, uid: u64, action: OrderAction, price: i64, size: i64
     }
 }
 
+fn cancel_cmd(order_id: u64, uid: u64) -> OrderCommand {
+    OrderCommand {
+        command: OrderCommandType::CancelOrder,
+        uid,
+        order_id,
+        symbol: 600000,
+        ..Default::default()
+    }
+}
+
 /// 在 LocalSet 上引导一个真实撮合核心，供各用例使用
 async fn bootstrap(name: &str) -> (Arc<CoreBridge>, JoinHandle<()>, JoinHandle<()>) {
     let dir = fixture_dir(name);
@@ -225,14 +235,7 @@ fn case6_cancel_restores_frozen_balance() {
         // 冻结 100×500×1 + 100×3 = 50,300（fixture 起始 10,000,000）
         assert_eq!(bridge.balances_of(10001).get(&840), Some(&9_949_700));
 
-        let cancel = OrderCommand {
-            command: OrderCommandType::CancelOrder,
-            uid: 10001,
-            order_id: 1,
-            symbol: 600000,
-            ..Default::default()
-        };
-        bridge.submit(cancel).await.unwrap();
+        bridge.submit(cancel_cmd(1, 10001)).await.unwrap();
         // 等待撤单结果经广播结算（最多 2s）
         let mut restored = false;
         for _ in 0..200 {
@@ -247,6 +250,37 @@ fn case6_cancel_restores_frozen_balance() {
             "撤单后冻结资金应全额解冻，实际 {:?}",
             bridge.balances_of(10001)
         );
+
+        core_task.abort();
+        result_task.abort();
+    });
+}
+
+/// 用例 6b：同步撤单 API（HTTP /cancel 的路径）—— 一次 await 拿到终态，
+/// 且目标订单不存在时也必须立即返回拒绝码（否则会白等到超时）
+#[test]
+fn case6b_cancel_returns_synchronous_report() {
+    run_local(async {
+        let (bridge, core_task, result_task) = bootstrap("case6b").await;
+        bridge
+            .execute(place_cmd(1, 10001, OrderAction::Bid, 500, 100))
+            .await
+            .unwrap();
+
+        let report = bridge.cancel(cancel_cmd(1, 10001)).await.unwrap();
+        assert!(report.accepted, "撤单应被受理: {report:?}");
+        assert_eq!(report.result_code, CommandResultCode::Success);
+        assert_eq!(report.status, Some(OrderStatus::Filled));
+        assert_eq!(report.leaves_qty, Some(0));
+        assert_eq!(
+            bridge.balances_of(10001).get(&840),
+            Some(&10_000_000),
+            "撤单后冻结资金应全额解冻"
+        );
+
+        let missing = bridge.cancel(cancel_cmd(999_999, 10001)).await.unwrap();
+        assert!(!missing.accepted);
+        assert_eq!(missing.status, None);
 
         core_task.abort();
         result_task.abort();

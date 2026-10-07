@@ -45,7 +45,7 @@ async fn run(cfg: config::Config) {
                 std::process::exit(1);
             });
 
-        let app = handle::router(bridge.clone());
+        let app = handle::router(bridge.clone(), name);
         let addr: SocketAddr = format!("127.0.0.1:{}", conf.server_port)
             .parse()
             .unwrap_or_else(|e| panic!("监听地址无效 ({}): {e}", conf.server_port));

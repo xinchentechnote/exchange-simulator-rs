@@ -263,6 +263,8 @@ pub struct OrderRequest {
 2. **reserve_price 策略**：None → 取 `price`（限价单冻结额即 `size×price×quote_scale_k+fee`，因撮合只会以不劣于限价的价格成交，安全）；显式给定时必须 `>= price`（买单），否则 400。预算单（FOK_BUDGET 等）语义相反（price 即预算上限），校验规则随之调整。**P0 修复已先以「字段为 0 时按委托价冻结」的等价规则落地**（DTO 仍是必填 u64，Option 化调整在 T1.1）。
 3. `order_id`/`user_id`/`symbol` 的存在性校验（账户已注册、标的已加载）不在 DTO 层做——由核心风控给出权威结果码，接入层透传。
 
+【现状（2026-10-07 更新）】上述设计已落地（validator 派生校验 + `reserve_price: Option<u64>`，`order_type` 仍为裸 String 由 §4.3 映射）。另新增 `CancelRequest { order_id, user_id }` 供 `POST /cancel` 使用——标的代码由订单注册表回查，故不入请求体。
+
 ### 4.3 `handle.rs` — axum 路由与 handler
 
 【现状】单 handler `place_order`：解析→构造命令→`tx.send().await.expect()`→返回 `true`。
@@ -289,6 +291,14 @@ pub async fn place_order(
 | `POST /place` | 下单（同步受理结果） | `PlaceOrderResponse` |
 | `GET /orders/:order_id` | 订单当前状态（来自 OrderRegistry/结果缓存） | 状态 + 成交明细 |
 | `GET /accounts/:uid/balances` | 账户各币种余额（联调对账用） | `Map<currency, amount>` |
+
+【现状（2026-10-07 更新）】已实现的路由为 7 条：上表三条 + `POST /cancel`（撤单，同步返回终态，§5.1）+ `GET /trades`、`GET /admin/state`（T3.3 对账）+ `GET /health`（就绪探针，核心命令通道关闭时 503）。
+
+三点与上述设计稿的差异：
+
+1. **提取器失败也返回统一 JSON 错误体**：handler 以 `Result<Json<T>, JsonRejection>`（及 `PathRejection`/`QueryRejection`）接收参数并转成 `SimError`，保留 axum 原状态码（400/415/422），避免畸形 JSON、路径参数非数字等场景返回纯文本；
+2. **路由状态是 `AppState { bridge, exchange }`**：`exchange` 市场名仅用于 `/health` 标注探针归属，`router(bridge, exchange)` 由 `main.rs` 按市场实例分别构建；
+3. **撤单不等价于「fire-and-forget」**：网关撤单仍走结果广播回报，HTTP `/cancel` 则在桥接层按被撤订单号登记一次性回传通道（`CoreBridge::cancel`），任何返回码都必须回传，否则等待方白等到超时。
 
 > 余额查询的实现：`core_bridge` 维护 `result_consumer` 回推的余额快照（`BalanceAdjustment`/成交结算后由结果事件推算），**不直接读核心**（核心无查询命令）。若精度不可接受，改为在引导时镜像一份初始余额并叠加结果事件流水（阶段一先实现后者，简单可靠）。
 
@@ -386,7 +396,7 @@ axum handler                    LocalSet 宿主任务                Disruptor �
 
 1. `result_consumer` 运行在 **Disruptor 消费线程**（非 async 上下文），用 **`std::sync::mpsc`**（无锁队列语义足够，非阻塞 `try_send`，满则丢弃并计数告警——结果通道容量 4096）；
 2. `result_task` 是 LocalSet 上的常驻任务，负责把结果分发到 `pending` 的 oneshot、更新 `registry`/`balances` 快照；
-3. 每条命令都以 `Success` 或拒绝码终态（见 §3.4 流转规则），**所有** PlaceOrder 都能等到结果；撤单同理（`MatchingUnknownOrderId` 也是终态）；
+3. 每条命令都以 `Success` 或拒绝码终态（见 §3.4 流转规则），**所有** PlaceOrder 都能等到结果；撤单同理（`MatchingUnknownOrderId` 也是终态）；HTTP `/cancel` 复用同一结果路由，按**被撤订单号**在 `cancel_pending` 登记一次性回传通道（回传 `CancelReport`），网关撤单仍走结果广播生成协议回报，两者互不影响；
 4. 超时兜底：等待方 5s 超时返回 504，并从 `pending` 移除；迟到的结果写入 `registry` 供 `GET /orders/:id` 补查。
 
 #### 4.6.3 ExecutionReport（结果模型）
@@ -532,7 +542,9 @@ pub struct OrderRecord {
 
 ### 5.1 HTTP API
 
-#### POST /place（v2，阶段一）
+> 【现状】每个市场实例独立监听（SSE `server_port`、SZSE 由配置决定），路由一致。
+
+#### POST /place
 
 请求体见 §4.2；成功响应（含受理与拒绝两种业务结果，HTTP 均为 200）：
 
@@ -546,20 +558,50 @@ pub struct OrderRecord {
 }
 ```
 
-错误响应（`ApiError` 统一体）：
+#### POST /cancel
 
-| HTTP | 场景 | body 示例 |
-|------|------|-----------|
-| 400 | action/order_type 非法、reserve_price < price | `{"error":"invalid_action","detail":"action must be 1 or 2"}` |
-| 409 | order_id 重复 | `{"error":"duplicate_order_id"}` |
-| 422 | 字段校验失败 | `{"error":"validation","fields":{"size":"must be greater than 0"}}` |
-| 503 | 命令通道关闭（核心不可用） | `{"error":"core_unavailable"}` |
-| 504 | 等待核心结果超时（5s） | `{"error":"core_timeout"}` |
+请求体只需目标订单与账户；标的代码由订单注册表回查（订单已被淘汰则撤不到）：
+
+```json
+{ "order_id": 10001, "user_id": 10001 }
+```
+
+响应为撤单终态 + 撤单后的订单快照（`status`/`leaves_qty` 在订单已被注册表淘汰时为 `null`）：
+
+```json
+{ "order_id": 10001, "result_code": "Success", "accepted": true,
+  "status": "filled", "leaves_qty": 0 }
+```
+
+> 撤单同步等待核心结果（与 `/place` 共用 `EXECUTE_TIMEOUT`）；解冻口径见 §4.6 的撤单镜像说明。对已进入终态的订单重复撤单返回 200 + `accepted=false` + `result_code=MatchingUnknownOrderId`，与交易所「撤拒」语义一致。
+
+#### 错误响应（统一 JSON 错误体）
+
+所有失败响应（含 JSON/路径/查询参数解析失败）都走同一形状 `{"error": <码>, "detail": <可选说明>}`，便于测试工具统一解析：
+
+| HTTP | error | 场景 |
+|------|-------|------|
+| 400 | `invalid_request` | action/order_type 非法、买单 reserve_price < 委托价；请求体不是合法 JSON；路径/查询参数类型不符 |
+| 404 | `order_not_found` | `GET /orders/:order_id` 无记录；`POST /cancel` 目标订单不存在 |
+| 409 | `duplicate_order_id` | order_id 已存在于注册表或仍在途 |
+| 409 | `cancel_in_flight` | 同一订单已有撤单请求在途 |
+| 415 | `invalid_request` | `POST` 缺少 `Content-Type: application/json` |
+| 422 | `validation` | 字段校验失败（`{"error":"validation","fields":{"size":"range"}}`）；JSON 字段类型不符（如 `reserve_price` 传负数） |
+| 503 | `core_unavailable` | 命令通道关闭（核心停机中）；`GET /health` 亦用此码 |
+| 504 | `core_timeout` | 等待核心结果超时（`EXECUTE_TIMEOUT`，当前 5s） |
 
 > **受理结果说明**：`result_code=Success` 仅表示订单被交易所接受（可能已成交或挂在簿上）；风控/撮合拒绝时 `accepted=false` 且 `result_code` 为拒绝码（§3.4）。**语义修正通告**：v1 中 action `"1"` 曾映射为卖出，v2 起按 `1=买 / 2=卖` 执行，联调方需同步调整。
 
-#### GET /orders/:order_id → `ExecutionReport` + `status`（404 若无记录）
-#### GET /accounts/:uid/balances → `{"10001": {"840": 999500}}`（键为 currency）
+#### 查询接口
+
+| 方法/路径 | 响应 |
+|-----------|------|
+| `GET /orders/:order_id` | `OrderRecord`（§4.6）：状态、成交明细（含对手方回填）、冻结参数；无记录 404 |
+| `GET /accounts/:uid/balances` | 扁平映射 `{"840": 999500}`，键为币种（`currency`），值为余额镜像 |
+| `GET /trades?symbol=&limit=` | `TradeView` 数组（内存环形缓冲，按时间正序）；`limit` 缺省 100、上限 1000 |
+| `GET /admin/state` | `{"orders_total","trades_total","registry_size","balance_sums"}`，对账用 |
+| `GET /health` | `{"status":"ok","exchange":"sse"}`；核心命令通道已关闭时返回 503 `core_unavailable` |
+
 
 ### 5.2 SSE 二进制协议（网关，阶段二）
 
@@ -592,16 +634,21 @@ pub struct OrderRecord {
 
 ### 6.3 内部错误类型
 
+【现状（2026-10-07）】`src/errors.rs` 实现如下（`Data` 类错误在引导阶段以 `anyhow::Result` + `Context` fail-fast 处理，不进入本枚举）：
+
 ```rust
 pub enum SimError {
-    Validation { field: &'static str, msg: String },   // → 400/422
+    BadRequest { status: StatusCode, detail: String },  // → 400；提取器拒绝沿用原状态码（415/422）
+    OrderNotFound,                                      // → 404（订单查询/撤单目标不存在）
+    Validation { fields: BTreeMap<String, String> },    // → 422（字段级错误明细）
     DuplicateOrderId,                                   // → 409
+    CancelInFlight,                                     // → 409（同一订单撤单在途）
     CoreUnavailable,                                    // → 503
     CoreTimeout,                                        // → 504
-    Data(String),                                       // → 启动失败
 }
-pub type SimResult<T> = Result<T, SimError>;
 ```
+
+`JsonRejection`/`PathRejection`/`QueryRejection` 经 `From` 归一为 `BadRequest`，因此接入层任何失败都是 `{error, detail?}` 的 JSON 形状（§5.1）。
 
 ### 6.4 核心结果码 → SSE `ord_rej_reason` 映射（设计值，模拟器自定义，集中常量定义）
 

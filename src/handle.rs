@@ -2,30 +2,40 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Request, State};
-use axum::http::StatusCode;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use matching_core::{OrderAction, OrderCommand, OrderCommandType, OrderType};
 use tracing::info;
 use validator::Validate;
 
-use crate::core_bridge::CoreBridge;
+use crate::core_bridge::{CancelReport, CoreBridge, OrderRecord};
 use crate::errors::SimError;
-use crate::model::OrderRequest;
+use crate::model::{CancelRequest, OrderRequest};
 
 /// HTTP 路由。接口规格见 docs/DEVELOPMENT_DESIGN.md §5.1。
-pub fn router(bridge: Arc<CoreBridge>) -> Router {
+/// `exchange` 仅用于 /health 标明探针属于哪个市场实例。
+pub fn router(bridge: Arc<CoreBridge>, exchange: &'static str) -> Router {
+    let state = AppState { bridge, exchange };
     Router::new()
         .route("/place", post(place_order))
+        .route("/cancel", post(cancel_order))
         .route("/orders/{order_id}", get(get_order))
         .route("/accounts/{uid}/balances", get(get_balances))
         .route("/trades", get(get_trades))
         .route("/admin/state", get(get_admin_state))
-        .with_state(bridge)
+        .route("/health", get(health))
+        .with_state(state)
         .layer(axum::middleware::from_fn(trace_middleware))
+}
+
+#[derive(Clone)]
+struct AppState {
+    bridge: Arc<CoreBridge>,
+    exchange: &'static str,
 }
 
 async fn trace_middleware(req: Request, next: Next) -> Response {
@@ -76,9 +86,10 @@ fn parse_order_type(order_type: &str) -> Option<(OrderType, Option<i64>)> {
 }
 
 async fn place_order(
-    State(bridge): State<Arc<CoreBridge>>,
-    Json(request): Json<OrderRequest>,
+    State(state): State<AppState>,
+    payload: Result<Json<OrderRequest>, JsonRejection>,
 ) -> Result<Json<crate::core_bridge::ExecutionReport>, SimError> {
+    let Json(request) = payload?;
     info!("收到委托请求: {:?}", request);
     request.validate().map_err(SimError::from_validation)?;
 
@@ -119,26 +130,52 @@ async fn place_order(
         ..Default::default()
     };
 
-    let report = bridge.execute(command).await?;
+    let report = state.bridge.execute(command).await?;
     Ok(Json(report))
 }
 
-async fn get_order(State(bridge): State<Arc<CoreBridge>>, Path(order_id): Path<u64>) -> Response {
-    match bridge.order_record(order_id) {
-        Some(record) => Json(record).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "order_not_found" })),
-        )
-            .into_response(),
-    }
+/// 撤单：目标订单的标的由注册表回查，撤单结果同步返回（含解冻后的订单快照）。
+async fn cancel_order(
+    State(state): State<AppState>,
+    payload: Result<Json<CancelRequest>, JsonRejection>,
+) -> Result<Json<CancelReport>, SimError> {
+    let Json(request) = payload?;
+    info!("收到撤单请求: {:?}", request);
+    request.validate().map_err(SimError::from_validation)?;
+
+    let record = state
+        .bridge
+        .order_record(request.order_id)
+        .ok_or(SimError::OrderNotFound)?;
+
+    let command = OrderCommand {
+        command: OrderCommandType::CancelOrder,
+        uid: request.user_id,
+        order_id: request.order_id,
+        symbol: record.symbol,
+        ..Default::default()
+    };
+    Ok(Json(state.bridge.cancel(command).await?))
+}
+
+async fn get_order(
+    State(state): State<AppState>,
+    path: Result<Path<u64>, PathRejection>,
+) -> Result<Json<OrderRecord>, SimError> {
+    let Path(order_id) = path?;
+    let record = state
+        .bridge
+        .order_record(order_id)
+        .ok_or(SimError::OrderNotFound)?;
+    Ok(Json(record))
 }
 
 async fn get_balances(
-    State(bridge): State<Arc<CoreBridge>>,
-    Path(uid): Path<u64>,
-) -> Json<BTreeMap<i32, i64>> {
-    Json(bridge.balances_of(uid))
+    State(state): State<AppState>,
+    path: Result<Path<u64>, PathRejection>,
+) -> Result<Json<BTreeMap<i32, i64>>, SimError> {
+    let Path(uid) = path?;
+    Ok(Json(state.bridge.balances_of(uid)))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -149,22 +186,34 @@ struct TradesQuery {
 
 /// 最近成交流水（内存环形缓冲，按时间正序；limit 截取最近 N 笔，上限 1000）
 async fn get_trades(
-    State(bridge): State<Arc<CoreBridge>>,
-    axum::extract::Query(q): axum::extract::Query<TradesQuery>,
-) -> Json<Vec<crate::core_bridge::TradeView>> {
+    State(state): State<AppState>,
+    query: Result<axum::extract::Query<TradesQuery>, QueryRejection>,
+) -> Result<Json<Vec<crate::core_bridge::TradeView>>, SimError> {
+    let axum::extract::Query(q) = query?;
     let limit = q.limit.unwrap_or(100).min(1000);
-    Json(bridge.recent_trades(q.symbol, limit))
+    Ok(Json(state.bridge.recent_trades(q.symbol, limit)))
 }
 
 /// 运行汇总（对账用）
-async fn get_admin_state(State(bridge): State<Arc<CoreBridge>>) -> Json<serde_json::Value> {
-    let s = bridge.state_summary();
+async fn get_admin_state(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let s = state.bridge.state_summary();
     Json(serde_json::json!({
         "orders_total": s.orders_total,
         "trades_total": s.trades_total,
         "registry_size": s.registry_size,
         "balance_sums": s.balance_sums,
     }))
+}
+
+/// 就绪探针：核心命令通道关闭（正在停机）时返回 503，供编排脚本轮询等待
+async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>, SimError> {
+    if !state.bridge.core_available() {
+        return Err(SimError::CoreUnavailable);
+    }
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "exchange": state.exchange,
+    })))
 }
 
 #[cfg(test)]

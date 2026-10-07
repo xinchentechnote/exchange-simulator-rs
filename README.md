@@ -6,7 +6,7 @@
 
 ## 特性
 
-- **行为仿真**：资金冻结、手续费、部分成交、多种订单类型（GTC/IOC/FOK/FOK_BUDGET/IOC_BUDGET/POST_ONLY/DAY/GTD）；撤单经二进制协议网关下达（HTTP 侧仅下单）
+- **行为仿真**：资金冻结、手续费、部分成交、多种订单类型（GTC/IOC/FOK/FOK_BUDGET/IOC_BUDGET/POST_ONLY/DAY/GTD）；撤单可经 HTTP `POST /cancel` 或二进制协议网关下达
 - **高性能**：撮合核心基于 Disruptor 环形缓冲区 + 单线程流水线（`LocalSet` + `current_thread` 运行时），全整数运算、零锁竞争
 - **故障恢复**：运行期 WAL 持久化，进程崩溃后全量重放恢复余额冻结与订单簿
 - **协议网关**：SSE / SZSE 二进制协议接入（含会话状态机、回执回报），HTTP 接口用于轻量联调
@@ -50,17 +50,29 @@ curl -X POST http://127.0.0.1:8080/place -H 'Content-Type: application/json' \
 - `reserve_price`（可选）：买单资金冻结预留价，缺省或 0 时按 `price` 冻结；买单该值低于委托价会被拒绝
 - `symbol` / `user_id` 需存在于 `data/{market}/` 的基础数据中
 
+撤单示例（标的无需另传，由订单注册表回查；同步返回撤单终态与解冻后的订单快照）：
+
+```bash
+curl -X POST http://127.0.0.1:8080/cancel -H 'Content-Type: application/json' \
+  -d '{"order_id":1,"user_id":10001}'
+# {"order_id":1,"result_code":"Success","accepted":true,"status":"filled","leaves_qty":0}
+```
+
 ## HTTP 接口
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `POST` | `/place` | 下单，返回执行报告 |
+| `POST` | `/cancel` | 撤单，返回撤单终态 + 订单快照；目标订单不存在返回 404 |
 | `GET` | `/orders/{order_id}` | 查询订单记录，不存在返回 404 `order_not_found` |
 | `GET` | `/accounts/{uid}/balances` | 查询账户余额，响应为 `{币种: 金额}` 映射 |
 | `GET` | `/trades?symbol=&limit=` | 最近成交流水（内存环形缓冲，按时间正序；`limit` 默认 100、上限 1000） |
 | `GET` | `/admin/state` | 运行汇总，用于对账（订单/成交总数、注册表规模、余额合计） |
+| `GET` | `/health` | 就绪探针，返回 `{"status":"ok","exchange":"sse"}`；核心停机中返回 503 |
 
-完整请求/响应字段与错误码定义见 [docs/DEVELOPMENT_DESIGN.md](./docs/DEVELOPMENT_DESIGN.md) §5。
+失败响应形状统一为 `{"error": <码>, "detail": <可选>}`，包括请求体不是合法 JSON（400）、缺 `Content-Type: application/json`（415）、路径/查询参数类型不符（400）等提取器失败场景。
+
+完整请求/响应字段与错误码定义见 [docs/DEVELOPMENT_DESIGN.md](./docs/DEVELOPMENT_DESIGN.md) §5.1。
 
 ## 目录结构
 

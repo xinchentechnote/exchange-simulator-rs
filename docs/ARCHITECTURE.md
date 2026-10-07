@@ -304,7 +304,7 @@ POST /place
 Content-Type: application/json
 
 {
-  "order_id": 1,          // u64，客户端自定义订单号（无去重校验）
+  "order_id": 1,          // u64，客户端自定义订单号（重复返回 409 duplicate_order_id）
   "user_id": 10001,       // u64，账户（必须已在账户 CSV 中引导）
   "action": "1",          // 1=买(Bid)、2=卖(Ask)，其他值返回 400（P0-1 已修复）
   "order_type": "GTC",    // GTC/IOC/FOK/FOK_BUDGET/IOC_BUDGET/POST_ONLY/DAY/GTD:<unix_ts>；
@@ -322,15 +322,18 @@ Content-Type: application/json
   "trades": [ {"size": 100, "price": 1000, "counterparty_order_id": 2} ] }
 ```
 
-错误响应：400 invalid_request（action/order_type/reserve_price 非法）、409 duplicate_order_id、422 validation（字段校验）、503 core_unavailable、504 core_timeout。
+错误响应：400 invalid_request（action/order_type/reserve_price 非法、请求体不是合法 JSON、路径/查询参数类型不符）、404 order_not_found、409 duplicate_order_id、415 invalid_request（缺 `Content-Type: application/json`）、422 validation（字段校验失败、JSON 字段类型不符）、503 core_unavailable、504 core_timeout。所有失败响应形状统一为 `{"error","detail?"}`（含提取器失败），规格见开发设计文档 §5.1。
 
 其他接口：
 
 | 方法/路径 | 说明 |
 |-----------|------|
+| `POST /cancel` | 撤单（同步返回终态 + 订单快照）；标的由注册表回查，订单已被淘汰返回 404 |
 | `GET /orders/{order_id}` | 订单当前状态（New/PartiallyFilled/Filled/Rejected + 成交明细，含对手方回填），不存在返回 404 |
-| `GET /accounts/{uid}/balances` | 账户各币种余额（由结果事件流水推算的镜像值） |
-```
+| `GET /accounts/{uid}/balances` | 账户各币种余额，扁平映射 `{"840": …}`（由结果事件流水推算的镜像值） |
+| `GET /trades?symbol=&limit=` | 最近成交流水（内存环形缓冲，`limit` 缺省 100、上限 1000） |
+| `GET /admin/state` | 运行汇总（订单/成交总数、注册表规模、各币种余额合计），对账用 |
+| `GET /health` | 就绪探针，返回 `{"status":"ok","exchange":"sse"}`；核心命令通道已关闭返回 503 |
 
 > 观察结果的补充方式：服务端 stdout 仍打印 `result: <command> - <result_code>`；HTTP 响应与查询接口是主要途径。
 

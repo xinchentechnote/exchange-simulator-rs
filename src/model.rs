@@ -27,6 +27,17 @@ pub struct OrderRequest {
     pub reserve_price: Option<u64>, // 买单资金冻结预留价；缺省或 0 表示按 price 冻结
 }
 
+/// POST /cancel 请求体。`order_id` 为被撤订单号；
+/// 标的代码由订单注册表回查，无需（也不允许）客户端另传。
+#[derive(Debug, Deserialize, Validate)]
+pub struct CancelRequest {
+    #[validate(range(min = 1, message = "order_id 必须大于 0"))]
+    pub order_id: u64,
+
+    #[validate(range(min = 1, message = "user_id 必须大于 0"))]
+    pub user_id: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +80,18 @@ mod tests {
         req.user_id = 0;
         let errors = req.validate().unwrap_err();
         assert!(errors.field_errors().contains_key("user_id"));
+    }
+
+    #[test]
+    fn test_cancel_request_valid() {
+        let req: CancelRequest = serde_json::from_str(r#"{"order_id":1,"user_id":10001}"#).unwrap();
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cancel_request_zero_order_id_rejected() {
+        let req: CancelRequest = serde_json::from_str(r#"{"order_id":0,"user_id":10001}"#).unwrap();
+        let errors = req.validate().unwrap_err();
+        assert!(errors.field_errors().contains_key("order_id"));
     }
 }

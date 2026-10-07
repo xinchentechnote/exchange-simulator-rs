@@ -106,6 +106,17 @@ pub struct ExecutionReport {
     pub trades: Vec<TradeFill>,
 }
 
+/// 撤单结果：核心返回码 + 撤单后的订单注册表快照。
+/// 目标订单已被淘汰或非本渠道下单时 `status`/`leaves_qty` 为空。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CancelReport {
+    pub order_id: u64,
+    pub result_code: CommandResultCode,
+    pub accepted: bool,
+    pub status: Option<OrderStatus>,
+    pub leaves_qty: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
@@ -142,6 +153,8 @@ pub struct OrderRecord {
 struct CoreShared {
     /// order_id → 结果回传通道（下单时插入，结果到达或超时后移除）
     pending: HashMap<u64, tokio::sync::oneshot::Sender<ExecutionReport>>,
+    /// 被撤订单 order_id → 撤单结果回传通道（HTTP /cancel 等待；网关撤单走结果广播）
+    cancel_pending: HashMap<u64, tokio::sync::oneshot::Sender<CancelReport>>,
     /// order_id → 订单最新状态（终态保留，直至容量淘汰）
     registry: HashMap<u64, OrderRecord>,
     registry_order: VecDeque<u64>,
@@ -235,7 +248,11 @@ impl CoreBridge {
             Ok(Ok(report)) => Ok(report),
             // 等待方未超时而通道被丢弃：桥接层正在停机
             Ok(Err(_)) => Err(crate::errors::SimError::CoreUnavailable),
-            Err(_) => Err(crate::errors::SimError::CoreTimeout),
+            Err(_) => {
+                // 否则该 order_id 会永久留在 pending 里，后续复用同一订单号会被误判为重复
+                self.shared.lock().unwrap().pending.remove(&order_id);
+                Err(crate::errors::SimError::CoreTimeout)
+            }
         }
     }
 
@@ -245,6 +262,37 @@ impl CoreBridge {
             .send(cmd)
             .await
             .map_err(|_| crate::errors::SimError::CoreUnavailable)
+    }
+
+    /// 提交 CancelOrder 并等待撤单终态（cmd.order_id 为被撤订单号）。
+    /// 等待方超时或停机时清理登记，同一订单不会被后续撤单误判为重复。
+    pub async fn cancel(&self, cmd: OrderCommand) -> Result<CancelReport, crate::errors::SimError> {
+        let order_id = cmd.order_id;
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut shared = self.shared.lock().unwrap();
+            if shared.cancel_pending.contains_key(&order_id) {
+                return Err(crate::errors::SimError::CancelInFlight);
+            }
+            shared.cancel_pending.insert(order_id, report_tx);
+        }
+        if self.command_tx.send(cmd).await.is_err() {
+            self.shared.lock().unwrap().cancel_pending.remove(&order_id);
+            return Err(crate::errors::SimError::CoreUnavailable);
+        }
+        match tokio::time::timeout(EXECUTE_TIMEOUT, report_rx).await {
+            Ok(Ok(report)) => Ok(report),
+            Ok(Err(_)) => Err(crate::errors::SimError::CoreUnavailable),
+            Err(_) => {
+                self.shared.lock().unwrap().cancel_pending.remove(&order_id);
+                Err(crate::errors::SimError::CoreTimeout)
+            }
+        }
+    }
+
+    /// 核心命令通道是否仍可写入（接收端随核心任务退出而关闭，用于就绪探针）
+    pub fn core_available(&self) -> bool {
+        !self.command_tx.is_closed()
     }
 
     /// 查询订单当前状态
@@ -333,12 +381,35 @@ fn route_result(
     }
 }
 
+/// 撤单结果处理：先按业务语义解冻记账，再回传给等待撤单终态的调用方。
+/// 回传必须在任何返回码下都执行（含拒绝），否则 HTTP /cancel 会白等到超时。
+fn on_cancel_result(
+    shared: &SharedState,
+    specs: &SpecMap,
+    audit: Option<&AuditWriter>,
+    cmd: &OrderCommand,
+) {
+    unfreeze_on_cancel(shared, specs, audit, cmd);
+    let mut shared = shared.lock().unwrap();
+    if let Some(report_tx) = shared.cancel_pending.remove(&cmd.order_id) {
+        let record = shared.registry.get(&cmd.order_id);
+        let accepted = cmd.result_code == CommandResultCode::Success;
+        let _ = report_tx.send(CancelReport {
+            order_id: cmd.order_id,
+            result_code: cmd.result_code,
+            accepted,
+            status: record.map(|r| r.status),
+            leaves_qty: record.map(|r| r.leaves_qty),
+        });
+    }
+}
+
 /// 撤单解冻镜像：按业务语义全额解冻剩余量（本金 + 手续费）。
 ///
 /// 注意：matching-core v0.2.2 撤单产出的 Reject 事件 `bidder_hold_price=0`，
 /// 其 R2 结算对买单只退手续费不退本金（上游缺陷）；镜像按正确语义计算，
 /// 因此余额镜像可能高于核心内部冻结口径（核心偏保守，风险方向安全）。
-fn on_cancel_result(
+fn unfreeze_on_cancel(
     shared: &SharedState,
     specs: &SpecMap,
     audit: Option<&AuditWriter>,
