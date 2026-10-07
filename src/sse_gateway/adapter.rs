@@ -11,7 +11,10 @@ use super::report::NsMeta;
 
 pub const SIDE_BUY: &str = "1";
 pub const SIDE_SELL: &str = "2";
-pub const ORD_TYPE_LIMIT: &str = "1";
+/// SSE Binary v0.57：OrdType 2=限价；"1"（市转撤）为历史约定兼容值，均按限价处理
+pub const ORD_TYPE_LIMIT: &str = "2";
+/// 历史/兼容取值（gt-auto 用例沿用），同样按限价处理
+pub const ORD_TYPE_LIMIT_COMPAT: &str = "1";
 pub const TIF_DAY: &str = "0";
 pub const TIF_IOC: &str = "1";
 pub const TIF_FOK: &str = "2";
@@ -34,7 +37,7 @@ fn parse_side(side: &str) -> Option<OrderAction> {
 }
 
 fn order_type_of(ord_type: &str, tif: &str) -> Option<(OrderType, &'static str)> {
-    if ord_type != ORD_TYPE_LIMIT {
+    if ord_type != ORD_TYPE_LIMIT && ord_type != ORD_TYPE_LIMIT_COMPAT {
         return None; // 仅支持限价
     }
     match tif {
@@ -227,7 +230,7 @@ mod tests {
         );
 
         let mut nos = sample_nos();
-        nos.ord_type = "2".into(); // 市价等非限价暂不支持
+        nos.ord_type = "3".to_string(); // 市转限等非限价暂不支持
         assert_eq!(
             new_order(&nos).unwrap_err(),
             super::super::report::REJ_INTERNAL
