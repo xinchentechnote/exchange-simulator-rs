@@ -88,7 +88,11 @@ pub fn spawn_listener(
     let shared = Arc::new(GatewayShared::new(bridge.clone()));
     tokio::task::spawn_local(async move {
         // 结果订阅任务：终态广播 → 回报生成
-        tokio::task::spawn_local(result_loop(shared.clone(), bridge.subscribe_results()));
+        tokio::task::spawn_local(result_loop(
+            shared.clone(),
+            bridge.subscribe_results(),
+            shutdown.clone(),
+        ));
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
@@ -109,23 +113,32 @@ pub fn spawn_listener(
     })
 }
 
-/// 消费结果广播，驱动回报生成。
-async fn result_loop(shared: Arc<GatewayShared>, mut results: broadcast::Receiver<OrderCommand>) {
+/// 消费结果广播，驱动回报生成。停机信号到达时主动退出：
+/// 否则 result_loop → shared → bridge → broadcast 发送端构成存活环，
+/// 命令通道无法关闭，core_task 只能等主流程 5s 超时。
+async fn result_loop(
+    shared: Arc<GatewayShared>,
+    mut results: broadcast::Receiver<OrderCommand>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
-        match results.recv().await {
-            Ok(cmd) => match cmd.command {
-                matching_core::OrderCommandType::PlaceOrder => {
-                    report::on_place_result(&shared, &cmd);
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            recv = results.recv() => match recv {
+                Ok(cmd) => match cmd.command {
+                    matching_core::OrderCommandType::PlaceOrder => {
+                        report::on_place_result(&shared, &cmd);
+                    }
+                    matching_core::OrderCommandType::CancelOrder => {
+                        report::on_cancel_result(&shared, &cmd);
+                    }
+                    _ => {}
+                },
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(n, "网关结果订阅滞后，部分终态被跳过");
                 }
-                matching_core::OrderCommandType::CancelOrder => {
-                    report::on_cancel_result(&shared, &cmd);
-                }
-                _ => {}
-            },
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!(n, "网关结果订阅滞后，部分终态被跳过");
+                Err(broadcast::error::RecvError::Closed) => break,
             }
-            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }

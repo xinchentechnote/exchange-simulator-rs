@@ -93,7 +93,7 @@ data/{sse,szse}/       symbol_data.csv、account_data.csv 基础数据
                        以及运行期 wal.log、orders.jsonl
 testcase/{sse,szse}/   gt-auto 用例（csv）与网关配置
 tests/                 集成测试（双市场 + 各网关）
-scripts/               recovery_drill.sh（WAL 恢复演练）
+scripts/               sim.sh（服务起停/重启/故障恢复/状态查看）、recovery_drill.sh（WAL 恢复演练）
 docs/                  架构与详细设计文档
 ```
 
@@ -113,9 +113,12 @@ docs/                  架构与详细设计文档
 
 ```bash
 cargo test                      # 单元测试 + tests/ 集成测试
-./autotest.sh                   # SSE + SZSE 双市场场景回归，需安装 gt-auto 且服务已在 9010/9011 启动
+./scripts/sim.sh start          # 启动服务（--clean 清理 WAL 后全新启动）
+./scripts/sim.sh status         # 查看运行状态与监听端口
+./autotest.sh                   # SSE + SZSE 双市场场景回归（需已安装 gt-auto；sim.sh stop 后 start --clean 可保证全新状态）
 bash scripts/recovery_drill.sh before && \
   bash scripts/recovery_drill.sh after   # WAL 崩溃恢复演练（before 后手工 kill -9 并重启）
+./scripts/sim.sh recover        # 一键故障恢复演练：kill -9 → 重启 → WAL 重放 → 前后对账
 ```
 
 CI（`.github/workflows/ci.yml`）执行 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`cargo build --release`，`CARGO_NET_GIT_FETCH_WITH_CLI=true` 用于拉取 git 依赖。

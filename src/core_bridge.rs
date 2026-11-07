@@ -711,6 +711,12 @@ fn spawn_core_task(
         while let Some(cmd) = command_rx.recv().await {
             core.submit_command(cmd);
         }
+        // 通知 Disruptor 消费线程停止自旋，释放其闭包持有的结果通道发送端；
+        // 否则结果通道永不关闭，result_task 只能等 5s 超时退出
+        core.submit_command(OrderCommand {
+            command: OrderCommandType::ShutdownSignal,
+            ..Default::default()
+        });
         info!("命令通道已关闭，撮合核心任务退出");
     })
 }
