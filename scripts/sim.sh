@@ -7,7 +7,9 @@
 #   start     启动服务（--clean 先清理 WAL 与审计流水，全新启动）
 #   stop      优雅停止（SIGINT 触发三阶段停机，超时后 SIGKILL 兜底）
 #   restart   重启（stop + start；默认保留 WAL，重启即重放恢复）
-#   recover   故障恢复演练：kill -9 模拟崩溃 → 重启 → WAL 全量重放 →
+#   recover   故障恢复：服务停止/崩溃后的拉起（不主动杀进程）。
+#             WAL 存在即自动全量重放（应用内建行为），输出重放证据与对账汇总
+#   drill     崩溃演练：kill -9 模拟崩溃 → 拉起 → WAL 重放 →
 #             对比崩溃前后 /admin/state 对账
 #   status    查看运行状态、监听端口与健康探针
 # 说明:
@@ -32,14 +34,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="$2"; shift 2 ;;
     --clean)  CLEAN=1; shift ;;
-    start|stop|restart|recover|status) COMMAND="$1"; shift ;;
+    start|stop|restart|recover|drill|status) COMMAND="$1"; shift ;;
     *) echo "未知参数: $1"; usage; exit 2 ;;
   esac
 done
 [ -n "$COMMAND" ] || { usage; exit 2; }
 
 usage() {
-  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 log()  { echo "[sim] $*"; }
@@ -198,6 +200,36 @@ cmd_restart() {
 }
 
 cmd_recover() {
+  # 故障恢复：服务停止/崩溃后的拉起。是否重放 WAL 由应用决定（WAL 存在且非空
+  # 即全量重放并跳过 CSV 账户引导），本命令不主动杀进程、不清理状态。
+  CLEAN=0
+  if is_running; then
+    log "服务已在运行（PID $(find_pids)），无需恢复；如需主动验证恢复链路，用 drill 命令"
+    return 0
+  fi
+  [ -f "$CONFIG" ] || fail "配置不存在: $CONFIG"
+  local wal_bytes=0
+  for w in "$ROOT"/data/{sse,szse}/wal.log; do
+    [ -f "$w" ] && wal_bytes=$((wal_bytes + $(wc -c < "$w" | tr -d ' ')))
+  done
+  if [ "$wal_bytes" -eq 0 ]; then
+    log "无 WAL（被 --clean 清理过或从未运行），将全新启动"
+  fi
+  local log_mark=0
+  [ -f "$LOG_FILE" ] && log_mark=$(wc -l < "$LOG_FILE" | tr -d ' ')
+  start_one
+  if [ "$wal_bytes" -gt 0 ] \
+     && tail -n +$((log_mark + 1)) "$LOG_FILE" | grep -q "WAL 重放完成"; then
+    log "WAL 重放确认 ✅（本次启动日志出现「WAL 重放完成」）"
+  fi
+  local http
+  http=$(market_rows | head -1 | awk '{print $2}')
+  log "恢复后对账汇总: $(curl -sf -m 2 "http://127.0.0.1:$http/admin/state" 2>/dev/null || echo 不可达)"
+}
+
+cmd_drill() {
+  # 崩溃演练：kill -9 模拟崩溃 → 拉起（WAL 自动重放）→ 前后对账。
+  CLEAN=0
   local pids state_before=""
   pids=$(find_pids)
   if [ -n "$pids" ]; then
@@ -207,7 +239,7 @@ cmd_recover() {
     rm -f "$PID_FILE"
     sleep 1
   else
-    log "服务未运行（可能已崩溃），直接拉起恢复"
+    log "服务未运行，直接拉起（无崩溃前对账快照）"
   fi
   start_one
   local http state_after
@@ -259,5 +291,6 @@ case "$COMMAND" in
   stop)    cmd_stop ;;
   restart) cmd_restart ;;
   recover) cmd_recover ;;
+  drill)   cmd_drill ;;
   status)  cmd_status ;;
 esac
